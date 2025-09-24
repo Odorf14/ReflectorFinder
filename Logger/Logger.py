@@ -235,4 +235,26 @@ if __name__ == "__main__":
 #             - Mark in the dxf which are missing, along with their mapping coordinates
 #                   - Taking into account the relative position of the LGV to the reflector and averaging
 #                   - Taking into account max absolute distance from LGV to reflector 
+#                   - Use DBSCAN to define clusters. Average the coordinates to map
+#                   - Use score from different time, lgv, angle? to determine confidence and color
+#                   - Compare with reflectors in layout
+#                       - Mark if they're missing or just moved
+#                       * import sqlite3
+#                       * conn = sqlite3.connect(r'')
+#                       * cur = conn.cursor()
+#                       * cur.execute("SELECT ID, X, Y FROM Reflectors")
+#                       * rows = cur.fetchall()
+#                       * for row in rows: print(row)
+#                       * conn.close()
+#                   - For the average to map, use an average of the average of each lgv
+#                       * Calculate lgv mean - consensus (mean of means) per each reflector
+#                       * Determine a threshold to flag big biases (std or vector (x+y) > refl diameter/2)
+#                       * In flagged per lgv, check if it's consistent: similar bias, most cases
+#                       * Flag that lgv for calibration.
+#                           > If similar bias, apply correction and compute means again
+#                           > If different bias, reduce weight and compute means again
+#                       * Minimum amount of reflectors (5?) needed to calculate bias
+#                       * Extra: calculate angle between lgv and reflector and add pole radius to pos
+#           - Apply similar analysis with different logs (all reflectors) to determine lgvs in need
+#               of calibration
 # """
