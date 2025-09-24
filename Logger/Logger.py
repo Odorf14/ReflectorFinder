@@ -101,17 +101,22 @@ def main():
     current_hour = datetime.now().hour
     log_file = open(get_log_path(lgv_num), mode='w', newline='')
     csv_writer = csv.writer(log_file)
-    csv_writer.writerow(["Lgv","Timestamp","WorldX", "WorldY"])
+    csv_writer.writerow(["Lgv","Timestamp","WorldX", "WorldY", "LgvX", "LgvY"])
     # -----------------------------
     # Connect to PLC
     # -----------------------------
     plc = pyads.Connection(PLC_AMS_ID, PORT, PLC_IP)
     plc.open()
 
-    # -----------------------------
-    # Get symbol of first reflector (base offset)
-    # -----------------------------
-    symbol = plc.get_symbol("Sys_ExternalLocalization.extReflectorSet[1].reflectors[0]")
+    # Get symbols for efficient access
+    avoid_reflector_symbol = plc.get_symbol("CustomPlcAttribute.AvoidReflectorCheck_sp")
+    quality_symbol = plc.get_symbol("Sys_ExternalLocalization.extPoseInfo.quality")
+    Aut_Run_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.Aut_Run")
+
+    #Get symbols for LGV coordinates
+    LgvPosX_symbol = plc.get_symbol("LibraryInterfaces.LGV.Guid.Info.Pos.X")
+    LgvPosY_symbol = plc.get_symbol("LibraryInterfaces.LGV.Guid.Info.Pos.Y")
+
 
     previousReflectors = []
 
@@ -123,16 +128,33 @@ def main():
                 cleanup_old_logs()
                 log_file = open(get_log_path(lgv_num), mode='w', newline='')
                 csv_writer = csv.writer(log_file)
-                csv_writer.writerow(["Lgv","Timestamp","WorldX", "WorldY"])
+                csv_writer.writerow(["Lgv","Timestamp","WorldX", "WorldY", "LgvX", "LgvY"])
                 current_hour = now.hour
                 print(f"Started new log file at {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
             # Read entire array of structs in one ADS request
             try:
-                raw_data_list = plc.read_by_name(
-                  "Sys_ExternalLocalization.extReflectorSet[1].reflectors",
-                  ctypes.c_ubyte * (StructSize * NumReflectors)  # Use c_ubyte for bytes 0..255
-             )
+                avoid_reflector = avoid_reflector_symbol.read()
+                quality = quality_symbol.read()
+                Aut_Run = Aut_Run_symbol.read()
+                
+                if not avoid_reflector and Aut_Run and quality > 0.8:
+                    print("Reading reflectors...")
+                    raw_data_list = plc.read_by_name(
+                        "Sys_ExternalLocalization.extReflectorSet[1].reflectors",
+                        ctypes.c_ubyte * (StructSize * NumReflectors)  # Use c_ubyte for bytes 0..255
+                    )
+
+                    LgvPosX = round(LgvPosX_symbol.read())
+                    LgvPosY = round(LgvPosY_symbol.read())
+
+                else:
+                    if avoid_reflector:print("AvoidReflectorCheck_sp... skipping")
+                    elif not Aut_Run: print("LGV not in Auto... skipping")
+                    else: print(f'Low quality({quality:.3f})... skipping')
+                    time.sleep(1)
+                    continue
+
             except pyads.ADSError as e:
                 print(f"Read failed: {e}")
                 try:
@@ -173,17 +195,18 @@ def main():
 
             # Log results
             if filteredReflectors:
-                
-                print("Non-associated reflectors detected:")
+                print(f"Detected {len(filteredReflectors)} new unassociated reflectors:")
                 for i, (wx, wy, assoc) in enumerate(filteredReflectors):
                     timestamp = datetime.now().isoformat(timespec='milliseconds')
                     csv_writer.writerow([
                         lgv_num,
                         timestamp,
-                        f"{wx:.3f}",
-                        f"{wy:.3f}"
+                        f"{round(wx*1000)}",
+                        f"{round(wy*1000)}",
+                        LgvPosX,
+                        LgvPosY
                     ])
-                    print(f"Reflector {i+1}: worldX={wx:.3f}, worldY={wy:.3f}")
+                    print(f"Reflector {i+1}: worldX={round(wx*1000)}, worldY={round(wy*1000)}")
 
             previousReflectors = newReflectors
 
@@ -206,8 +229,6 @@ if __name__ == "__main__":
 
 
 # """NEXT STEPS:
-#         - Add logging for LGV current coordinates
-#         - Check that LGV is localized and moving in auto for logger!!!
 #         - In post processing we could:
 #             - Cluster nearby reflectors (DBSCAN?)
 #             - Define a score with different LGVs to define which reflectors are truly missing
