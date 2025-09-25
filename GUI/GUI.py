@@ -4,12 +4,13 @@ import csv
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QAction,
     QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsEllipseItem,
-    QWidget, QVBoxLayout, QProgressDialog
+    QWidget, QVBoxLayout, QProgressDialog, QTextEdit, QSplitter
 )
 from PyQt5.QtGui import QPen, QPainter, QColor
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import numpy as np
 from ReflectorFinder import analyzeReflectors
+import sqlite3
 
 
 class CSVLoaderThread(QThread):
@@ -101,6 +102,7 @@ class DXFViewer(QGraphicsView):
         self.all_points = np.array([], dtype=np.float32)
         self.dot_items = []
         self.reflector_items = []  # Store reflector visualization items
+        self.layoutReflector_items = []  # Store layout reflector visualization items
         
         # Batch processing for graphics items
         self.batch_size = 1000
@@ -271,6 +273,27 @@ class DXFViewer(QGraphicsView):
         
         self.reflector_items.clear()
         print("[INFO] Cleared reflector visualizations.")
+
+    def load_layoutReflectors(self, db3_path):
+        """Load reflectors from db3"""
+        conn = sqlite3.connect(db3_path)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT ID, X, Y FROM Reflectors")
+        rows = cursor.fetchall()
+
+        conn.close()
+        self.visualize_layoutReflectors([(row[1], row[2]) for row in rows])
+    
+    def clear_layoutReflectors(self):
+        """Clear layout reflector visualizations from the scene"""
+        print("[INFO] Clearing layout reflector visualizations...")
+        
+        for item in self.layoutReflector_items:
+            self.scene.removeItem(item)
+        
+        self.layoutReflector_items.clear()
+        print("[INFO] Cleared layout reflector visualizations.")
         
     def visualize_reflectors(self, reflector_scores):
         """Create yellow circles for found reflectors with hover tooltips"""
@@ -281,35 +304,85 @@ class DXFViewer(QGraphicsView):
             print("[INFO] No reflectors to visualize.")
             return
         
-        circle_radius = 200  # Radius for reflector circles
+        circle_radius = 750  # Radius for reflector circles
+        center_dot_radius = 32  # Small white center dot - actual reflector
+        
         yellow_color = QColor(255, 255, 0, 100)  # Semi-transparent yellow
-        pen = QPen(QColor(255, 255, 0, 200), 3)  # Yellow border
+        yellow_pen = QPen(QColor(255, 255, 0, 200), 3)  # Yellow border
+        
+        white_color = QColor(255, 255, 255, 255)  # Opaque white
+        white_pen = QPen(QColor(255, 255, 255, 255), 2)  # White border
         
         for cluster_id, centroid, confidence in reflector_scores:
             x, y = centroid[0], centroid[1]
             
-            # Create circle
+            # Create main yellow circle
             circle = QGraphicsEllipseItem(
                 x - circle_radius, y - circle_radius,
                 circle_radius * 2, circle_radius * 2
             )
-            circle.setPen(pen)
+            circle.setPen(yellow_pen)
             circle.setBrush(yellow_color)
             circle.setZValue(10)  # Above everything else
             
-            # Set tooltip with reflector info
+            # Create small white center dot
+            center_dot = QGraphicsEllipseItem(
+                x - center_dot_radius, y - center_dot_radius,
+                center_dot_radius * 2, center_dot_radius * 2
+            )
+            center_dot.setPen(white_pen)
+            center_dot.setBrush(white_color)
+            center_dot.setZValue(11)  # Above the yellow circle
+            
+            # Set tooltip for both items
             tooltip_text = (f"Reflector {cluster_id}\n"
                           f"Confidence: {confidence:.3f}\n"
                           f"X: {x:.1f}\n"
                           f"Y: {y:.1f}")
             circle.setToolTip(tooltip_text)
+            center_dot.setToolTip(tooltip_text)
             
-            # Add to scene and store reference
+            # Add to scene and store references
             self.scene.addItem(circle)
+            self.scene.addItem(center_dot)
             self.reflector_items.append(circle)
+            self.reflector_items.append(center_dot)
         
-        print(f"[INFO] Visualized {len(reflector_scores)} reflectors as yellow circles.")
+        print(f"[INFO] Visualized {len(reflector_scores)} reflectors as yellow circles with white centers.")
         
+    def visualize_layoutReflectors(self, layoutReflectors):
+        """Create blue dots for layout reflectors"""
+        dot_radius = 100  # Smaller radius for dense data
+        dot_pen = QPen()
+        dot_pen.setWidth(0)
+        
+        # Blue color for all dots
+        blue_color = QColor(0, 0, 250, 180)  # Semi-transparent red
+        dot_pen.setColor(blue_color)
+        
+        # Create dots in batches
+        layoutReflector_items_to_add = []
+        
+        for x, y in layoutReflectors:
+            ellipse = QGraphicsEllipseItem(x - dot_radius / 2, y - dot_radius / 2, dot_radius, dot_radius)
+            ellipse.setPen(dot_pen)
+            ellipse.setBrush(blue_color)
+            ellipse.setZValue(2)
+            
+            self.layoutReflector_items.append(ellipse)
+            layoutReflector_items_to_add.append(ellipse)
+            
+            # Add to scene in batches
+            if len(layoutReflector_items_to_add) >= self.batch_size:
+                for item in layoutReflector_items_to_add:
+                    self.scene.addItem(item)
+                layoutReflector_items_to_add.clear()
+
+        # Add remaining items
+        for item in layoutReflector_items_to_add:
+            self.scene.addItem(item)
+
+
     def wheelEvent(self, event):
         """Handle mouse wheel zoom with proper anchor point"""
         # Get the position of the mouse in scene coordinates
@@ -334,9 +407,41 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Reflector Finder")
 
-        # Create and set central widget
+        # Create splitter to divide main view and console
+        self.main_widget = QWidget()
+        self.setCentralWidget(self.main_widget)
+        
+        # Create layout for main widget
+        main_layout = QVBoxLayout(self.main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Create splitter (vertical split)
+        self.splitter = QSplitter(Qt.Vertical)
+        main_layout.addWidget(self.splitter)
+        
+        # Create and add viewer to top part of splitter
         self.viewer = DXFViewer()
-        self.setCentralWidget(self.viewer)
+        self.splitter.addWidget(self.viewer)
+        
+        # Create console output area
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMaximumHeight(200)  # Limit height
+        self.console.setStyleSheet("""
+            QTextEdit {
+                background-color: #1a1a1a;
+                color: #00ff00;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 11px;
+                border: 1px solid #555;
+            }
+        """)
+        self.console.setPlainText("Console Output:\n" + "="*50)
+        self.splitter.addWidget(self.console)
+        
+        # Set splitter proportions (80% viewer, 20% console)
+        self.splitter.setSizes([800, 200])
+        self.splitter.setCollapsible(1, True)  # Console can be collapsed
 
         # Setup menu
         self.init_menu()
@@ -354,6 +459,11 @@ class MainWindow(QMainWindow):
         load_dxf_action = QAction("Load DXF", self)
         load_dxf_action.triggered.connect(self.load_dxf_file)
         file_menu.addAction(load_dxf_action)
+
+        #Load layout reflectors action
+        load_layoutReflectors_action = QAction("Load reflectors from layout", self)
+        load_layoutReflectors_action.triggered.connect(self.load_layoutReflectors_file)
+        file_menu.addAction(load_layoutReflectors_action)
         
         file_menu.addSeparator()
 
@@ -371,6 +481,18 @@ class MainWindow(QMainWindow):
         clear_reflectors_action = QAction("Clear Reflectors", self)
         clear_reflectors_action.triggered.connect(self.viewer.clear_reflectors)
         file_menu.addAction(clear_reflectors_action)
+
+        #Clear layout reflectors action
+        clear_layoutReflectors_action = QAction("Clear Layout Reflectors", self)
+        clear_layoutReflectors_action.triggered.connect(self.viewer.clear_layoutReflectors)
+        file_menu.addAction(clear_layoutReflectors_action)
+        
+        file_menu.addSeparator()
+        
+        # Clear console action
+        clear_console_action = QAction("Clear Console", self)
+        clear_console_action.triggered.connect(self.clear_console)
+        file_menu.addAction(clear_console_action)
         
         # ANALYSIS MENU
         analysis_menu = menubar.addMenu("Analysis")
@@ -379,6 +501,11 @@ class MainWindow(QMainWindow):
         find_reflectors_action = QAction("Find Reflectors", self)
         find_reflectors_action.triggered.connect(self.find_reflectors_placeholder)
         analysis_menu.addAction(find_reflectors_action)
+
+    def clear_console(self):
+        """Clear the console output area"""
+        self.console.clear()
+        self.console.setPlainText("Console Output:\n" + "="*50)
 
     def load_dxf_file(self):
         """Load DXF file via file dialog"""
@@ -391,6 +518,13 @@ class MainWindow(QMainWindow):
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Open CSV Files", "", "CSV Files (*.csv)")
         if file_paths:
             self.viewer.load_csv_files_async(file_paths)
+
+    def load_layoutReflectors_file(self):
+        """Load reflectors from db3"""
+
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Layout.db3", "", "DB3 Files (*.db3)")
+        if file_path:
+            self.viewer.load_layoutReflectors(file_path)
             
     def find_reflectors_placeholder(self):
         """Run reflector finding analysis and display results"""
@@ -405,7 +539,7 @@ class MainWindow(QMainWindow):
         reflector_scores = analyzeReflectors(
             self.viewer.all_points, 
             self.viewer.all_events,
-            confidence_threshold=0.3
+            confidence_threshold=0.8
         )
         
         # Display console output

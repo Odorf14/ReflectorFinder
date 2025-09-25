@@ -8,12 +8,13 @@ def findClusters(points):
     if len(points) == 0:
         return np.array([])
     
-    dbscan = DBSCAN(eps=32, min_samples=7)
+    dbscan = DBSCAN(eps=10, min_samples=15)
     cluster_flags = dbscan.fit_predict(points)
+
     return cluster_flags
 
 
-def findReflectors(points, cluster_flags):
+def findReflectors(points, cluster_flags, max_radius = 120):
     """Extract reflector positions from clusters"""
     reflectors = []
     for cluster_id in set(cluster_flags):
@@ -21,11 +22,16 @@ def findReflectors(points, cluster_flags):
             continue  # Skip noise
         cluster_points = points[cluster_flags == cluster_id]
         centroid = cluster_points.mean(axis=0)
+
+        dists = np.linalg.norm(cluster_points - centroid, axis=1)
+        if dists.max() > max_radius:
+            continue  # reject large / long linear cluster instead of punctual
+
         reflectors.append((cluster_id, centroid))
     return reflectors
 
 
-def calcConfidence(cluster_events, max_freq=10, max_lgv=5):
+def calcConfidence(cluster_events, max_freq=25, max_lgv=10):
     """Calculate confidence score for each reflector based on events"""
     
     if not cluster_events:
@@ -49,12 +55,12 @@ def calcConfidence(cluster_events, max_freq=10, max_lgv=5):
         seconds = [(t - timestamps[0]).total_seconds() for t in timestamps]
         time_span = max(seconds) - min(seconds) + 1  # Avoid division by zero
         # Inverse relationship: smaller time span = higher score
-        time_score = min(1.0, time_span / 1800)  # Peak score when events distanced by >30 minutes
+        time_score = min(1.0, time_span / 3600)  # Peak score when events distanced by >60 minutes
     else:
         time_score = 1.0
     
     # Combine scores with weights
-    confidence_score = (0.2 * freq_score) + (0.6 * lgv_score) + (0.2 * time_score)
+    confidence_score = (0.20 * freq_score) + (0.5 * lgv_score) + (0.30 * time_score)
     return confidence_score
 
 
@@ -117,7 +123,7 @@ def analyzeReflectors(points_array, all_events, confidence_threshold=0.3):
     return reflector_scores
 
 
-def layoutCompare(layout_path, clusters):
+def layoutCompare(layoutReflectors, clusters):
     """Compare the found clusters with the reflectors in the layout"""
     # TO BE DEVELOPED LATER
     pass
