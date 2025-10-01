@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QPen, QPainter, QColor
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import numpy as np
-from ReflectorFinder import analyzeReflectors
+from ReflectorFinder import (analyzeReflectors, correctPointPos)
 import sqlite3
 
 
@@ -188,7 +188,7 @@ class DXFViewer(QGraphicsView):
         self.csv_loader_thread.finished_loading.connect(self.on_all_csv_loaded)
         self.csv_loader_thread.start()
         
-    def on_csv_file_loaded(self, filename, points, events):
+    def on_csv_file_loaded(self, filename, points, events, correct_points = False):
         """Handle individual CSV file loaded"""
         print(f"[INFO] Processing {filename} with {len(points)} points...")
         
@@ -200,12 +200,16 @@ class DXFViewer(QGraphicsView):
         
         self.all_events.extend(events)
         
+        #Adjusting offset assuming every point is a real reflector.
+        #Only for visualization, the adjustment is done again during analysis.
+        if correct_points: points = correctPointPos(events, reflector_radius=32)
+
         # Create red dots for all points
         self.create_red_dots(points)
         
     def create_red_dots(self, points):
         """Create small red dots for all points"""
-        dot_radius = 50  # Smaller radius for dense data
+        dot_radius = 15  # Smaller radius for dense data
         dot_pen = QPen()
         dot_pen.setWidth(0)
         
@@ -352,12 +356,12 @@ class DXFViewer(QGraphicsView):
         
     def visualize_layoutReflectors(self, layoutReflectors):
         """Create blue dots for layout reflectors"""
-        dot_radius = 100  # Smaller radius for dense data
+        dot_radius = 100
         dot_pen = QPen()
         dot_pen.setWidth(0)
         
         # Blue color for all dots
-        blue_color = QColor(0, 0, 250, 180)  # Semi-transparent red
+        blue_color = QColor(0, 0, 250, 255) 
         dot_pen.setColor(blue_color)
         
         # Create dots in batches
@@ -529,39 +533,59 @@ class MainWindow(QMainWindow):
     def find_reflectors_placeholder(self):
         """Run reflector finding analysis and display results"""
         if len(self.viewer.all_points) == 0:
-            print("[ERROR] No data loaded. Please load CSV files first.")
+            error_msg = "[ERROR] No data loaded. Please load CSV files first."
+            print(error_msg)
+            self.log_to_console(error_msg)
             return
         
-        print("[INFO] Starting reflector analysis...")
-        print("=" * 50)
+        start_msg = "[INFO] Starting reflector analysis..."
+        print(start_msg)
+        self.log_to_console(start_msg)
+        self.log_to_console("=" * 50)
         
         # Run the analysis
         reflector_scores = analyzeReflectors(
             self.viewer.all_points, 
             self.viewer.all_events,
-            confidence_threshold=0.8
+            confidence_threshold=0.8,
+            offset_correction=False
         )
         
         # Display console output
-        print("\n" + "=" * 50)
-        print("REFLECTOR ANALYSIS RESULTS")
-        print("=" * 50)
+        self.log_to_console("\nREFLECTOR ANALYSIS RESULTS")
+        self.log_to_console("=" * 50)
         
         if reflector_scores:
-            print("Found reflectors:")
+            self.log_to_console("Found reflectors:")
             for i, (cluster_id, centroid, confidence) in enumerate(reflector_scores, 1):
                 x, y = centroid[0], centroid[1]
-                print(f"Reflector {i}: Confidence: {confidence:.3f}, X: {x:.1f}, Y: {y:.1f}")
+                result_line = f"Reflector {i}: Confidence: {confidence:.3f}, X: {x:.1f}, Y: {y:.1f}"
+                print(result_line)
+                self.log_to_console(result_line)
             
             # Visualize the reflectors
             self.viewer.visualize_reflectors(reflector_scores)
             
-            print(f"\nTotal reflectors found: {len(reflector_scores)}")
-            print("Yellow circles have been added to the map. Hover over them for details.")
-        else:
-            print("No reflectors found with sufficient confidence.")
+            summary_msg = f"\nTotal reflectors found: {len(reflector_scores)}"
+            visual_msg = "Yellow circles have been added to the map. Hover over them for details."
             
-        print("=" * 50)
+            print(summary_msg)
+            print(visual_msg)
+            self.log_to_console(summary_msg)
+            self.log_to_console(visual_msg)
+        else:
+            no_results_msg = "No reflectors found with sufficient confidence."
+            print(no_results_msg)
+            self.log_to_console(no_results_msg)
+            
+        self.log_to_console("=" * 50)
+        
+    def log_to_console(self, message):
+        """Add message to the embedded console"""
+        self.console.append(message)
+        # Auto-scroll to bottom
+        scrollbar = self.console.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
 
 def apply_dark_theme(app):

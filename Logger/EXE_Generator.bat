@@ -1,9 +1,9 @@
 @echo off
 
-pyinstaller --onefile --add-data "TcAdsDll.dll;." --name "ReflectorFinder" Logger.py
+pyinstaller --onefile --add-data "TcAdsDll.dll;." --name "ReflectorFinderLogger" Logger.py
 
 echo.
 
-echo Build finished! Check the "dist" folder for ReflectorFinder.exe
+echo Build finished! Check the "dist" folder for ReflectorFinderLogger.exe
 
 pause
