@@ -468,13 +468,13 @@ class MainWindow(QMainWindow):
         load_layoutReflectors_action = QAction("Load reflectors from layout", self)
         load_layoutReflectors_action.triggered.connect(self.load_layoutReflectors_file)
         file_menu.addAction(load_layoutReflectors_action)
-        
-        file_menu.addSeparator()
 
         # Load CSV action
         load_csv_action = QAction("Load Logs", self)
         load_csv_action.triggered.connect(self.load_csv_files)
         file_menu.addAction(load_csv_action)
+
+        file_menu.addSeparator()
         
         # Clear dots action
         clear_dots_action = QAction("Clear Points", self)

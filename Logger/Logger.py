@@ -11,6 +11,8 @@ import re
 log_dir = r"D:\Logs\MissingReflectors"
 MAX_LOG_FOLDER_SIZE_MB = 20
 os.makedirs(log_dir, exist_ok=True)
+one_file = True
+LOG_DURATION_HOURS = 8
 
 #Connection to PLC
 PLC_AMS_ID = '192.168.11.2.1.1'
@@ -97,21 +99,28 @@ def extract_lgv_number():
 
 
 def main():
+    if one_file:print(f"[INFO] One file mode. Logging for {LOG_DURATION_HOURS} hours.")
+
     next_time = time.perf_counter()
     current_hour = datetime.now().hour
     log_file = open(get_log_path(lgv_num), mode='w', newline='')
     csv_writer = csv.writer(log_file)
     csv_writer.writerow(["Lgv","Timestamp","WorldX", "WorldY", "LgvX", "LgvY"])
+
+    #For one file mode (8 hours and then stop)
+    start_time = time.perf_counter()
+    end_time = start_time + (LOG_DURATION_HOURS * 3600) if one_file else None
     # -----------------------------
     # Connect to PLC
     # -----------------------------
     plc = pyads.Connection(PLC_AMS_ID, PORT, PLC_IP)
     plc.open()
 
-    # Get symbols for efficient access
+    # Get symbols
     avoid_reflector_symbol = plc.get_symbol("CustomPlcAttribute.AvoidReflectorCheck_sp")
     quality_symbol = plc.get_symbol("Sys_ExternalLocalization.extPoseInfo.quality")
     Aut_Run_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.Aut_Run")
+    isNotMoving_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.IsNotMoving")
 
     #Get symbols for LGV coordinates
     LgvPosX_symbol = plc.get_symbol("LibraryInterfaces.LGV.Guid.Info.Pos.X")
@@ -122,8 +131,13 @@ def main():
 
     try:
         while True:
+            # Exit after 8h for one file mode
+            if one_file and end_time is not None and time.perf_counter() >= end_time:
+                print("Reached max log duration. Stopping.")
+                break
+
             now = datetime.now()
-            if now.hour != current_hour:
+            if now.hour != current_hour and not one_file:
                 log_file.close()
                 cleanup_old_logs()
                 log_file = open(get_log_path(lgv_num), mode='w', newline='')
@@ -137,8 +151,9 @@ def main():
                 avoid_reflector = avoid_reflector_symbol.read()
                 quality = quality_symbol.read()
                 Aut_Run = Aut_Run_symbol.read()
+                isNotMoving = isNotMoving_symbol.read()
                 
-                if not avoid_reflector and Aut_Run and quality > 0.8:
+                if not avoid_reflector and Aut_Run and not isNotMoving and quality > 0.8:
                     print("Reading reflectors...")
                     raw_data_list = plc.read_by_name(
                         "Sys_ExternalLocalization.extReflectorSet[1].reflectors",
@@ -151,6 +166,7 @@ def main():
                 else:
                     if avoid_reflector:print("AvoidReflectorCheck_sp... skipping")
                     elif not Aut_Run: print("LGV not in Auto... skipping")
+                    elif isNotMoving: print("LGV is not moving... skipping")
                     else: print(f'Low quality({quality:.3f})... skipping')
                     time.sleep(1)
                     continue
@@ -222,6 +238,7 @@ def main():
     finally:
         plc.close()
         log_file.close()
+        cleanup_old_logs()
 
 if __name__ == "__main__":
     lgv_num = extract_lgv_number()

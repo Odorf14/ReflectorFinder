@@ -26,13 +26,13 @@ def findClusters(points):
     if len(points) == 0:
         return np.array([])
     
-    dbscan = DBSCAN(eps=3.5, min_samples=20)
+    dbscan = DBSCAN(eps=3.5, min_samples=30)
     cluster_flags = dbscan.fit_predict(points)
 
     return cluster_flags
 
 
-def findReflectors(points, cluster_flags, radius_filter = True, max_radius = 130, circular_filter = False, circularity = 0.15):
+def findReflectors(points, cluster_flags, radius_filter = True, min_radius = 10, max_radius = 130, circular_filter = False, circularity = 0.15):
     """Extract reflector positions from clusters"""
     reflectors = []
     for cluster_id in set(cluster_flags):
@@ -55,8 +55,8 @@ def findReflectors(points, cluster_flags, radius_filter = True, max_radius = 130
 
         dists = np.linalg.norm(cluster_points - centroid, axis=1)
         if radius_filter:
-            if (dists > max_radius).mean() > 0.1:
-                continue  # reject large / long linear cluster instead of punctual
+            if ((dists > max_radius).mean() > 0.1):# or ((dists > min_radius).mean() < 0.07):
+                continue  # reject large / long linear cluster instead of punctual / too small
         
         if circular_filter:
             if dists.std() / dists.mean() > circularity:
