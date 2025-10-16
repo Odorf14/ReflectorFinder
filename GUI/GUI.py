@@ -112,7 +112,7 @@ class DXFViewer(QGraphicsView):
         self.progress_dialog = None
         
         # Initialize empty scene with dark background
-        self.setBackgroundBrush(QColor(10, 10, 10))
+        self.setBackgroundBrush(QColor(45, 45, 45))
 
     def load_dxf(self, path):
         """Load and display DXF file"""
@@ -308,7 +308,7 @@ class DXFViewer(QGraphicsView):
             print("[INFO] No reflectors to visualize.")
             return
         
-        circle_radius = 750  # Radius for reflector circles
+        circle_radius = 1750  # Radius for reflector circles
         center_dot_radius = 32  # Small white center dot - actual reflector
         
         yellow_color = QColor(255, 255, 0, 100)  # Semi-transparent yellow
@@ -433,8 +433,8 @@ class MainWindow(QMainWindow):
         self.console.setMaximumHeight(200)  # Limit height
         self.console.setStyleSheet("""
             QTextEdit {
-                background-color: #1a1a1a;
-                color: #00ff00;
+                background-color: #2D2D2D;
+                color: #C8C8C8;
                 font-family: 'Consolas', 'Courier New', monospace;
                 font-size: 11px;
                 border: 1px solid #555;
@@ -567,7 +567,7 @@ class MainWindow(QMainWindow):
             self.viewer.visualize_reflectors(reflector_scores)
             
             summary_msg = f"\nTotal reflectors found: {len(reflector_scores)}"
-            visual_msg = "Yellow circles have been added to the map. Hover over them for details."
+            visual_msg = "Yellow circles highlighting found reflectors. Hover over them for details."
             
             print(summary_msg)
             print(visual_msg)

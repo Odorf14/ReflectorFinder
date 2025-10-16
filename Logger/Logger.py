@@ -120,6 +120,7 @@ def main():
     avoid_reflector_symbol = plc.get_symbol("CustomPlcAttribute.AvoidReflectorCheck_sp")
     quality_symbol = plc.get_symbol("Sys_ExternalLocalization.extPoseInfo.quality")
     Aut_Run_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.Aut_Run")
+    Man_Run_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.Man_Run")
     isNotMoving_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.IsNotMoving")
 
     #Get symbols for LGV coordinates
@@ -151,9 +152,10 @@ def main():
                 avoid_reflector = avoid_reflector_symbol.read()
                 quality = quality_symbol.read()
                 Aut_Run = Aut_Run_symbol.read()
+                Man_Run = Man_Run_symbol.read()
                 isNotMoving = isNotMoving_symbol.read()
                 
-                if not avoid_reflector and Aut_Run and not isNotMoving and quality > 0.8:
+                if not avoid_reflector and (Aut_Run or Man_Run) and not isNotMoving and quality > 0.8:
                     print("Reading reflectors...")
                     raw_data_list = plc.read_by_name(
                         "Sys_ExternalLocalization.extReflectorSet[1].reflectors",
