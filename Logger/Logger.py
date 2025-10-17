@@ -6,22 +6,10 @@ import os
 from datetime import datetime
 import glob
 import re
-
-#Log file configuration
-log_dir = r"D:\Logs\MissingReflectors"
-MAX_LOG_FOLDER_SIZE_MB = 20
-os.makedirs(log_dir, exist_ok=True)
-one_file = True
-LOG_DURATION_HOURS = 8
-
-#Connection to PLC
-PLC_AMS_ID = '192.168.11.2.1.1'
-PLC_IP = '192.168.11.2'
-PORT = 851
+import xml.etree.ElementTree as ET
 
 
 NumReflectors = 50
-VarReadInterval = 1000  # ms
 StructSize = 88  # bytes per ReflectorInfo
 
 # -----------------------------
@@ -97,6 +85,82 @@ def extract_lgv_number():
         raise ValueError("No lgv number found.")
     
 
+def generate_configfile():
+    root = ET.Element("Configuration")
+    comm = ET.SubElement(root, "Communication")
+    ET.SubElement(comm, "AmsNetId").text = '192.168.11.2.1.1'
+    ET.SubElement(comm, "IpAddress").text = '192.168.11.2'
+    ET.SubElement(comm, "Port").text = '851'
+
+    log = ET.SubElement(root, "Log_config")
+    ET.SubElement(log, "OneFile").text = 'True'
+    ET.SubElement(log, "LogDurationHours").text = '8'
+    ET.SubElement(log, "ReadIntervalMs").text = '1000'
+    ET.SubElement(log, "LogFolder").text = r'D:\Logs\MissingReflectors'
+    ET.SubElement(log, "MaxLogFolderSizeMB").text = '20'
+
+    
+    symbols = ET.SubElement(root, "Symbols")
+    avoid_reflector = ET.SubElement(symbols, "AvoidReflectorCheck")
+    ET.SubElement(avoid_reflector, "Symbol").text = "CustomPlcAttribute.AvoidReflectorCheck_sp"
+    ET.SubElement(avoid_reflector, "Bypass").text = 'False'
+
+    quality = ET.SubElement(symbols, "Quality")
+    ET.SubElement(quality, "Symbol").text = "Sys_ExternalLocalization.extPoseInfo.quality"
+    ET.SubElement(quality, "Bypass").text = 'False'
+
+    aut_run = ET.SubElement(symbols, "Aut_Run")
+    ET.SubElement(aut_run, "Symbol").text = "LibraryInterfaces.LGV.Status.Aut_Run"
+    ET.SubElement(aut_run, "Bypass").text = 'False'
+
+    man_run = ET.SubElement(symbols, "Man_Run")
+    ET.SubElement(man_run, "Symbol").text = "LibraryInterfaces.LGV.Status.Man_Run"
+    ET.SubElement(man_run, "Bypass").text = 'False'
+
+    isNotMoving = ET.SubElement(symbols, "IsNotMoving")
+    ET.SubElement(isNotMoving, "Symbol").text = "LibraryInterfaces.LGV.Status.IsNotMoving"
+    ET.SubElement(isNotMoving, "Bypass").text = 'False'
+
+    lgvPosX = ET.SubElement(symbols, "LgvPosX")
+    ET.SubElement(lgvPosX, "Symbol").text = "LibraryInterfaces.LGV.Guid.Info.Pos.X"
+
+    lgvPosY = ET.SubElement(symbols, "LgvPosY")
+    ET.SubElement(lgvPosY, "Symbol").text = "LibraryInterfaces.LGV.Guid.Info.Pos.Y"
+
+    tree = ET.ElementTree(root)
+    tree.write(r'D:\Config\ReflectorFinderConfig.xml', encoding='utf-8', xml_declaration=True)
+
+def load_configuration():
+    config_path = r'D:\Config\ReflectorFinderConfig.xml'
+    if not os.path.exists(config_path):
+        print("[WARNING] Configuration file not found. Generating default config.")
+        generate_configfile()
+
+    tree = ET.parse(config_path)
+    root = tree.getroot()
+
+    plc_ams_id = root.find("Communication/AmsNetId").text
+    plc_ip = root.find("Communication/IpAddress").text
+    port = int(root.find("Communication/Port").text)
+
+    one_file = root.find("Log_config/OneFile").text.lower() == 'true'
+    log_duration = int(root.find("Log_config/LogDurationHours").text)
+    read_interval = int(root.find("Log_config/ReadIntervalMs").text)
+    log_folder = root.find("Log_config/LogFolder").text
+    max_log_size = int(root.find("Log_config/MaxLogFolderSizeMB").text)
+
+    symbols = {}
+    for symbol in root.find("Symbols"):
+        name = symbol.tag
+        symb_text = symbol.find("Symbol").text
+        bypass_elem = symbol.find("Bypass")
+        bypass = bypass_elem is not None and bypass_elem.text.lower() == 'true'
+        symbols[name] = (symb_text, bypass)
+
+    return plc_ams_id, plc_ip, port, one_file, log_duration, read_interval, log_folder, max_log_size, symbols
+
+    
+
 
 def main():
     if one_file:print(f"[INFO] One file mode. Logging for {LOG_DURATION_HOURS} hours.")
@@ -117,20 +181,31 @@ def main():
     plc.open()
 
     # Get symbols
-    avoid_reflector_symbol = plc.get_symbol("CustomPlcAttribute.AvoidReflectorCheck_sp")
-    quality_symbol = plc.get_symbol("Sys_ExternalLocalization.extPoseInfo.quality")
-    Aut_Run_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.Aut_Run")
-    Man_Run_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.Man_Run")
-    isNotMoving_symbol = plc.get_symbol("LibraryInterfaces.LGV.Status.IsNotMoving")
+    avoid_reflector_symbol = plc.get_symbol(symbols["AvoidReflectorCheck"][0])
+    quality_symbol = plc.get_symbol(symbols["Quality"][0])
+    Aut_Run_symbol = plc.get_symbol(symbols["Aut_Run"][0])
+    Man_Run_symbol = plc.get_symbol(symbols["Man_Run"][0])
+    isNotMoving_symbol = plc.get_symbol(symbols["IsNotMoving"][0])
+    LgvPosX_symbol = plc.get_symbol(symbols["LgvPosX"][0])
+    LgvPosY_symbol = plc.get_symbol(symbols["LgvPosY"][0])
 
-    #Get symbols for LGV coordinates
-    LgvPosX_symbol = plc.get_symbol("LibraryInterfaces.LGV.Guid.Info.Pos.X")
-    LgvPosY_symbol = plc.get_symbol("LibraryInterfaces.LGV.Guid.Info.Pos.Y")
-
+    #Get bypass flags
+    avoid_reflector_bypass = symbols["AvoidReflectorCheck"][1]
+    quality_bypass = symbols["Quality"][1]
+    Aut_Run_bypass = symbols["Aut_Run"][1]
+    Man_Run_bypass = symbols["Man_Run"][1]
+    isNotMoving_bypass = symbols["IsNotMoving"][1]
 
     previousReflectors = []
 
     try:
+        #initializing variables
+        avoid_reflector = False
+        quality = 0.0
+        Aut_Run = False
+        Man_Run = False
+        isNotMoving = True
+
         while True:
             # Exit after 8h for one file mode
             if one_file and end_time is not None and time.perf_counter() >= end_time:
@@ -154,22 +229,26 @@ def main():
                 Aut_Run = Aut_Run_symbol.read()
                 Man_Run = Man_Run_symbol.read()
                 isNotMoving = isNotMoving_symbol.read()
+
+                # Check bypasses
+                avoidref_ok = avoid_reflector_bypass or not avoid_reflector
+                quality_ok = quality_bypass or quality > 0.8
+                run_ok = (Aut_Run_bypass and Man_Run_bypass) or Aut_Run or Man_Run
+                notmoving_ok = isNotMoving_bypass or not isNotMoving
                 
-                if not avoid_reflector and (Aut_Run or Man_Run) and not isNotMoving and quality > 0.8:
+                if avoidref_ok and run_ok and notmoving_ok and quality_ok:
                     print("Reading reflectors...")
                     raw_data_list = plc.read_by_name(
                         "Sys_ExternalLocalization.extReflectorSet[1].reflectors",
                         ctypes.c_ubyte * (StructSize * NumReflectors)  # Use c_ubyte for bytes 0..255
                     )
 
-                    LgvPosX = round(LgvPosX_symbol.read())
-                    LgvPosY = round(LgvPosY_symbol.read())
-
                 else:
-                    if avoid_reflector:print("AvoidReflectorCheck_sp... skipping")
-                    elif not Aut_Run: print("LGV not in Auto... skipping")
-                    elif isNotMoving: print("LGV is not moving... skipping")
-                    else: print(f'Low quality({quality:.3f})... skipping')
+                    if not avoidref_ok:     print("AvoidReflectorCheck_sp active... skipping")
+                    elif not run_ok:        print("LGV not in run... skipping")
+                    elif not notmoving_ok:  print("LGV is not moving... skipping")
+                    elif not quality_ok:    print(f'Low quality({quality:.3f})... skipping')
+                    
                     time.sleep(1)
                     continue
 
@@ -182,6 +261,7 @@ def main():
                 time.sleep(1)
                 try:
                     plc.open()
+                    time.sleep(1)
                     continue
                 except pyads.ADSError as conn_err:
                     print(f"Reconnection failed: {conn_err}")
@@ -214,6 +294,10 @@ def main():
             # Log results
             if filteredReflectors:
                 print(f"Detected {len(filteredReflectors)} new unassociated reflectors:")
+
+                LgvPosX = round(LgvPosX_symbol.read())
+                LgvPosY = round(LgvPosY_symbol.read())
+                
                 for i, (wx, wy, assoc) in enumerate(filteredReflectors):
                     timestamp = datetime.now().isoformat(timespec='milliseconds')
                     csv_writer.writerow([
@@ -225,6 +309,8 @@ def main():
                         LgvPosY
                     ])
                     print(f"Reflector {i+1}: worldX={round(wx*1000)}, worldY={round(wy*1000)}")
+                
+                log_file.flush()
 
             previousReflectors = newReflectors
 
@@ -242,38 +328,15 @@ def main():
         log_file.close()
         cleanup_old_logs()
 
+
+
+
 if __name__ == "__main__":
+    PLC_AMS_ID, PLC_IP, PORT, one_file, LOG_DURATION_HOURS, VarReadInterval, log_dir, MAX_LOG_FOLDER_SIZE_MB, symbols = load_configuration()
+    
+    os.makedirs(log_dir, exist_ok=True)
+    
+    
     lgv_num = extract_lgv_number()
+    
     main()
-
-
-# """NEXT STEPS:
-#         - In post processing we could:
-#             - Cluster nearby reflectors (DBSCAN?)
-#             - Define a score with different LGVs to define which reflectors are truly missing
-#             - Mark in the dxf which are missing, along with their mapping coordinates
-#                   - Taking into account the relative position of the LGV to the reflector and averaging
-#                   - Taking into account max absolute distance from LGV to reflector 
-#                   - Use DBSCAN to define clusters. Average the coordinates to map
-#                   - Use score from different time, lgv, angle? to determine confidence and color
-#                   - Compare with reflectors in layout
-#                       - Mark if they're missing or just moved
-#                       * import sqlite3
-#                       * conn = sqlite3.connect(r'')
-#                       * cur = conn.cursor()
-#                       * cur.execute("SELECT ID, X, Y FROM Reflectors")
-#                       * rows = cur.fetchall()
-#                       * for row in rows: print(row)
-#                       * conn.close()
-#                   - For the average to map, use an average of the average of each lgv
-#                       * Calculate lgv mean - consensus (mean of means) per each reflector
-#                       * Determine a threshold to flag big biases (std or vector (x+y) > refl diameter/2)
-#                       * In flagged per lgv, check if it's consistent: similar bias, most cases
-#                       * Flag that lgv for calibration.
-#                           > If similar bias, apply correction and compute means again
-#                           > If different bias, reduce weight and compute means again
-#                       * Minimum amount of reflectors (5?) needed to calculate bias
-#                       * Extra: calculate angle between lgv and reflector and add pole radius to pos
-#           - Apply similar analysis with different logs (all reflectors) to determine lgvs in need
-#               of calibration
-# """
