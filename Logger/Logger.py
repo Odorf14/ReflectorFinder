@@ -7,6 +7,7 @@ from datetime import datetime
 import glob
 import re
 import xml.etree.ElementTree as ET
+import sys
 
 
 NumReflectors = 50
@@ -117,10 +118,40 @@ def extract_lgv_number():
         raise ValueError("No lgv number found.")
     
 
+
+def get_config_path():
+    """
+    Determine the best location for the config file.
+    Tries D:\Apps\ReflectorFinder first, falls back to exe directory if D:\Apps doesn't exist.
+    
+    Returns:
+        Path to the config file
+    """
+    primary_path = r'D:\Apps\ReflectorFinder'
+    
+    # Check if D:\Apps exists
+    if os.path.exists(r'D:\Apps'):
+        os.makedirs(primary_path, exist_ok=True)
+        return os.path.join(primary_path, 'RFConfig.xml')
+    else:
+        # Fallback to exe/script directory
+        if getattr(sys, 'frozen', False):
+            # Running as compiled exe
+            exe_dir = os.path.dirname(sys.executable)
+        else:
+            # Running as script
+            exe_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        fallback_path = os.path.join(exe_dir, 'ReflectorFinder')
+        os.makedirs(fallback_path, exist_ok=True)
+        print(f"[WARNING] D:\\Apps not found. Using fallback location: {fallback_path}")
+        return os.path.join(fallback_path, 'RFConfig.xml')
+
+
 def generate_configfile():
     """
     Generate a default configuration XML file with standard settings.
-    Creates ReflectorFinderConfig.xml in D:\Config\ with default PLC connection
+    Creates ReflectorFinderConfig.xml with default PLC connection
     settings, logging parameters, and symbol definitions.
     """
     root = ET.Element("Configuration")
@@ -131,7 +162,7 @@ def generate_configfile():
 
     log = ET.SubElement(root, "Log_config")
     ET.SubElement(log, "OneFile").text = 'True'
-    ET.SubElement(log, "LogDurationHours").text = '8'
+    ET.SubElement(log, "LogDurationHours").text = '8.0'
     ET.SubElement(log, "ReadIntervalMs").text = '1000'
     ET.SubElement(log, "LogFolder").text = r'D:\Logs\MissingReflectors'
     ET.SubElement(log, "MaxLogFolderSizeMB").text = '20'
@@ -164,8 +195,13 @@ def generate_configfile():
     lgvPosY = ET.SubElement(symbols, "LgvPosY")
     ET.SubElement(lgvPosY, "Symbol").text = "LibraryInterfaces.LGV.Guid.Info.Pos.Y"
 
+    ET.indent(root, space="  ", level=0)
+
+    config_path = get_config_path()
+    
     tree = ET.ElementTree(root)
-    tree.write(r'D:\Config\ReflectorFinderConfig.xml', encoding='utf-8', xml_declaration=True)
+    tree.write(config_path, encoding='utf-8', xml_declaration=True)
+    print(f"[INFO] Generated config file at: {config_path}")
 
 
 def load_configuration():
@@ -173,15 +209,18 @@ def load_configuration():
     Load configuration from XML file. Generates default config if file doesn't exist.
     
     Returns:
-        tuple: (plc_ams_id, plc_ip, port, one_file, log_duration, read_interval, 
+        tuple: (config_created, plc_ams_id, plc_ip, port, remoterun_enable, one_file, log_duration, read_interval, 
                 log_folder, max_log_size, symbols)
         
         symbols is a dict mapping symbol names to (symbol_path, bypass_flag) tuples
     """
-    config_path = r'D:\Config\ReflectorFinderConfig.xml'
+    config_path = get_config_path()
+    config_created = False
+    
     if not os.path.exists(config_path):
         print("[WARNING] Configuration file not found. Generating default config.")
         generate_configfile()
+        config_created = True
 
     tree = ET.parse(config_path)
     root = tree.getroot()
@@ -190,8 +229,10 @@ def load_configuration():
     plc_ip = root.find("Communication/IpAddress").text
     port = int(root.find("Communication/Port").text)
 
+    remoterun_enable = plc_ip is not None and plc_ip != '192.168.11.2'
+
     one_file = root.find("Log_config/OneFile").text.lower() == 'true'
-    log_duration = int(root.find("Log_config/LogDurationHours").text)
+    log_duration = float(root.find("Log_config/LogDurationHours").text)
     read_interval = int(root.find("Log_config/ReadIntervalMs").text)
     log_folder = root.find("Log_config/LogFolder").text
     max_log_size = int(root.find("Log_config/MaxLogFolderSizeMB").text)
@@ -204,7 +245,7 @@ def load_configuration():
         bypass = bypass_elem is not None and bypass_elem.text.lower() == 'true'
         symbols[name] = (symb_text, bypass)
 
-    return plc_ams_id, plc_ip, port, one_file, log_duration, read_interval, log_folder, max_log_size, symbols
+    return config_created, plc_ams_id, plc_ip, port, remoterun_enable, one_file, log_duration, read_interval, log_folder, max_log_size, symbols
 
 
 def main():
@@ -234,21 +275,21 @@ def main():
     plc = pyads.Connection(PLC_AMS_ID, PORT, PLC_IP)
     plc.open()
 
-    # Get PLC symbol handles
-    avoid_reflector_symbol = plc.get_symbol(symbols["AvoidReflectorCheck"][0])
-    quality_symbol = plc.get_symbol(symbols["Quality"][0])
-    Aut_Run_symbol = plc.get_symbol(symbols["Aut_Run"][0])
-    Man_Run_symbol = plc.get_symbol(symbols["Man_Run"][0])
-    isNotMoving_symbol = plc.get_symbol(symbols["IsNotMoving"][0])
-    LgvPosX_symbol = plc.get_symbol(symbols["LgvPosX"][0])
-    LgvPosY_symbol = plc.get_symbol(symbols["LgvPosY"][0])
-
     # Extract bypass flags from configuration
     avoid_reflector_bypass = symbols["AvoidReflectorCheck"][1]
     quality_bypass = symbols["Quality"][1]
-    Aut_Run_bypass = symbols["Aut_Run"][1]
-    Man_Run_bypass = symbols["Man_Run"][1]
+    aut_run_bypass = symbols["Aut_Run"][1]
+    man_run_bypass = symbols["Man_Run"][1]
     isNotMoving_bypass = symbols["IsNotMoving"][1]
+
+    # Get PLC symbol handles
+    if not avoid_reflector_bypass: avoid_reflector_symbol = plc.get_symbol(symbols["AvoidReflectorCheck"][0])
+    if not quality_bypass: quality_symbol = plc.get_symbol(symbols["Quality"][0])
+    if not aut_run_bypass: aut_run_symbol = plc.get_symbol(symbols["Aut_Run"][0])
+    if not man_run_bypass: man_run_symbol = plc.get_symbol(symbols["Man_Run"][0])
+    if not isNotMoving_bypass: isNotMoving_symbol = plc.get_symbol(symbols["IsNotMoving"][0])
+    LgvPosX_symbol = plc.get_symbol(symbols["LgvPosX"][0])
+    LgvPosY_symbol = plc.get_symbol(symbols["LgvPosY"][0])
 
     previousReflectors = []
 
@@ -256,8 +297,8 @@ def main():
         # Initialize variables before loop to prevent NameError on first iteration
         avoid_reflector = False
         quality = 0.0
-        Aut_Run = False
-        Man_Run = False
+        aut_run = False
+        man_run = False
         isNotMoving = True
 
         while True:
@@ -279,16 +320,16 @@ def main():
 
             try:
                 # Read condition variables from PLC
-                avoid_reflector = avoid_reflector_symbol.read()
-                quality = quality_symbol.read()
-                Aut_Run = Aut_Run_symbol.read()
-                Man_Run = Man_Run_symbol.read()
-                isNotMoving = isNotMoving_symbol.read()
+                avoid_reflector = avoid_reflector_symbol.read() if not avoid_reflector_bypass else False
+                quality = quality_symbol.read() if not quality_bypass else 0.0
+                aut_run = aut_run_symbol.read() if not aut_run_bypass else False
+                man_run = man_run_symbol.read() if not man_run_bypass else False
+                isNotMoving = isNotMoving_symbol.read() if not isNotMoving_bypass else False
 
                 # Evaluate conditions with bypass logic
                 avoidref_ok = avoid_reflector_bypass or not avoid_reflector
                 quality_ok = quality_bypass or quality > 0.8
-                run_ok = (Aut_Run_bypass and Man_Run_bypass) or Aut_Run or Man_Run
+                run_ok = (aut_run_bypass and man_run_bypass) or aut_run or man_run
                 notmoving_ok = isNotMoving_bypass or not isNotMoving
                 
                 if avoidref_ok and run_ok and notmoving_ok and quality_ok:
@@ -387,10 +428,61 @@ def main():
 
 
 if __name__ == "__main__":
-    PLC_AMS_ID, PLC_IP, PORT, one_file, LOG_DURATION_HOURS, VarReadInterval, log_dir, MAX_LOG_FOLDER_SIZE_MB, symbols = load_configuration()
-    
-    os.makedirs(log_dir, exist_ok=True)
-    
-    lgv_num = extract_lgv_number()
-    
-    main()
+    try:
+        config_created, PLC_AMS_ID, PLC_IP, PORT, remoterun_enable, one_file, LOG_DURATION_HOURS, VarReadInterval, log_dir, MAX_LOG_FOLDER_SIZE_MB, symbols = load_configuration()
+
+        if config_created:
+            print("[INFO] Please review and adjust the generated configuration file as needed, then restart the logger.")
+            sys.exit(0)
+
+        # Override log directory if remote run is enabled
+        if remoterun_enable:
+            if getattr(sys, 'frozen', False):
+                exe_dir = os.path.dirname(sys.executable)
+            else:
+                exe_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            log_dir = os.path.join(exe_dir, 'ReflectorFinder', 'Logs')
+            print(f"[INFO] Remote run mode: Logs will be saved to {log_dir}")
+        else:
+            # Check if log_dir drive exists, fallback to exe directory if not
+            log_drive = os.path.splitdrive(log_dir)[0]
+            if log_drive and not os.path.exists(log_drive + '\\'):
+                if getattr(sys, 'frozen', False):
+                    exe_dir = os.path.dirname(sys.executable)
+                else:
+                    exe_dir = os.path.dirname(os.path.abspath(__file__))
+                
+                log_dir = os.path.join(exe_dir, 'Logs', 'MissingReflectors')
+                print(f"[WARNING] Configured log drive not found. Using fallback: {log_dir}")
+
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Determine LGV number. Another IF for clarity.
+        if not remoterun_enable:
+            if os.path.exists(r'D:\Config\LGV.XML'):
+                try:
+                    lgv_num = extract_lgv_number()
+                except ValueError as e:
+                    lgv_num = 0
+                    print(f"[WARNING] {e}. Using LGV number 0.")
+            else:
+                lgv_num = 0
+                print("[WARNING] D:\\Config\\LGV.XML not found. Using LGV number 0.")
+        else:
+            lgv_num = 0
+            print("[INFO] Remote run mode enabled. Using LGV number 0.")
+
+        main()
+
+    except Exception as e:
+        print("\n" + "="*50)
+        print("FATAL ERROR - Logger crashed:")
+        print("="*50)
+        print(f"{type(e).__name__}: {e}")
+        print("\nFull traceback:")
+        import traceback
+        traceback.print_exc()
+        print("="*50)
+    finally:
+        input("\nPress Enter to exit...")
