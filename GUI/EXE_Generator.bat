@@ -1,6 +1,6 @@
 @echo off
 
-pyinstaller --onefile --noconsole --name "ReflectorFinderUI" GUI.py
+pyinstaller --onefile --noconsole --name "ReflectorFinderUI" --exclude-module PyQt6 GUI.py
 
 echo.
 

@@ -11,6 +11,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import numpy as np
 from ReflectorFinder import (analyzeReflectors, correctPointPos)
 import sqlite3
+import xml.etree.ElementTree as ET
+import os
 
 
 class CSVLoaderThread(QThread):
@@ -112,7 +114,7 @@ class DXFViewer(QGraphicsView):
         self.progress_dialog = None
         
         # Initialize empty scene with dark background
-        self.setBackgroundBrush(QColor(45, 45, 45))
+        self.setBackgroundBrush(QColor(50, 50, 50))
 
     def load_dxf(self, path):
         """Load and display DXF file"""
@@ -361,7 +363,7 @@ class DXFViewer(QGraphicsView):
         dot_pen.setWidth(0)
         
         # Blue color for all dots
-        blue_color = QColor(0, 0, 250, 255) 
+        blue_color = QColor(80, 80, 250, 255) 
         dot_pen.setColor(blue_color)
         
         # Create dots in batches
@@ -405,6 +407,115 @@ class DXFViewer(QGraphicsView):
         delta = new_pos - old_pos
         self.translate(delta.x(), delta.y())
 
+def get_config_path():
+    if getattr(sys, 'frozen', False):
+        # Running as compiled exe
+        exe_dir = os.path.dirname(sys.executable)
+    else:
+        # Running as script
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+
+    xml_path = os.path.join(exe_dir, 'ReflectorFinder')
+    os.makedirs(xml_path, exist_ok=True)
+    print(f"[WARNING] Loading config from: {xml_path}")
+    return os.path.join(xml_path, 'ReflectorFinder.xml')
+
+def generate_configfile():
+    """
+    Generate a default configuration XML file with standard settings.
+    Creates ReflectorFinder.xml with default GUI and analysisparameters.
+    """
+    root = ET.Element("Settings")
+
+    dbs = ET.SubElement(root, "DBSCAN")
+    ET.SubElement(dbs, "EPS").text = '3.5'
+    ET.SubElement(dbs, "MinSamples").text = '30'
+
+
+    confidence = ET.SubElement(root, "ConfidenceScores")
+    ET.SubElement(confidence, "ConfidenceCheck").text = 'True'
+    ET.SubElement(confidence, "MinConfidence").text = '0.8'
+
+
+    freq_score = ET.SubElement(confidence, "FrequencyScore")
+    ET.SubElement(freq_score, "Weight").text = '0.15'
+    ET.SubElement(freq_score, "MaxFreqThreshold").text = '50'
+
+    lgv_div_score = ET.SubElement(confidence, "LGVDiversityScore")
+    ET.SubElement(lgv_div_score, "Weight").text = '0.35'
+    ET.SubElement(lgv_div_score, "MaxLGVThreshold").text = '10'
+
+    timestamp_score = ET.SubElement(confidence, "TimestampScore")
+    ET.SubElement(timestamp_score, "Weight").text = '0.25'
+    ET.SubElement(timestamp_score, "MaxTimeVarianceSec").text = '7200'
+
+    spatial_score = ET.SubElement(confidence, "SpatialDistributionScore")
+    ET.SubElement(spatial_score, "Weight").text = '0.25'
+    ET.SubElement(spatial_score, "MaxSpatialStdDev").text = '10.0'
+
+
+    gui = ET.SubElement(root, "GUI_Settings")
+    log_reflector = ET.SubElement(gui, "Logged_Points")
+    ET.SubElement(log_reflector, "PointRadius").text = '15' #dot_radius
+
+    db3_reflector = ET.SubElement(gui, "DB3_Reflector")
+    ET.SubElement(db3_reflector, "PointRadius").text = '100'#dot_radius
+
+    found_reflector = ET.SubElement(gui, "Found_Reflector")
+    ET.SubElement(found_reflector, "PointRadius").text = '32' #center_dot_radius
+    ET.SubElement(found_reflector, "HighlightRadius").text = '1750' #circle_radius
+
+
+    ET.indent(root, space="  ", level=0)
+
+    config_path = get_config_path()
+    tree = ET.ElementTree(root)
+    tree.write(config_path, encoding='utf-8', xml_declaration=True)
+    print(f"[INFO] Generated config file at: {config_path}")
+
+def load_configuration():
+    """
+    Load configuration from XML file. Generates default config if file doesn't exist.
+    Returns:
+        tuple: (config_created, plc_ams_id, plc_ip, port, tc2, remoterun_enable, one_file, log_duration, read_interval, 
+                log_folder, max_log_size, symbols_tc3, symbols_tc2)
+        symbols is a dict mapping symbol names to (symbol_path, bypass_flag) tuples
+    """
+    #Normalizar weights
+    #Corregir docstring
+
+    config_path = get_config_path()
+    config_created = False
+
+    if not os.path.exists(config_path):
+        print("[WARNING] Configuration file not found. Generating default config.")
+        generate_configfile()
+        config_created = True
+
+    tree = ET.parse(config_path)
+    root = tree.getroot()
+
+    eps = float(root.find("DBSCAN/EPS").text)
+    min_samples = int(root.find("DBSCAN/MinSamples").text)
+    confidence_check = root.find("ConfidenceScores/ConfidenceCheck").text.lower() == 'true'
+    min_confidence = float(root.find("ConfidenceScores/MinConfidence").text)
+    freq_weight = float(root.find("ConfidenceScores/FrequencyScore/Weight").text)
+    max_freq_threshold = float(root.find("ConfidenceScores/FrequencyScore/MaxFreqThreshold").text)
+    lgv_div_weight = float(root.find("ConfidenceScores/LGVDiversityScore/Weight").text)
+    max_lgv_threshold = float(root.find("ConfidenceScores/LGVDiversityScore/MaxLGVThreshold").text)
+    timestamp_weight = float(root.find("ConfidenceScores/TimestampScore/Weight").text)
+    max_time_variance = float(root.find("ConfidenceScores/TimestampScore/MaxTimeVarianceSec").text)
+    spatial_weight = float(root.find("ConfidenceScores/SpatialDistributionScore/Weight").text)
+    max_spatial_stddev = float(root.find("ConfidenceScores/SpatialDistributionScore/MaxSpatialStdDev").text)
+    log_radius = int(root.find("GUI_Settings/Logged_Points/PointRadius").text)
+    db3_radius = int(root.find("GUI_Settings/DB3_Reflector/PointRadius").text)
+    reflector_radius = int(root.find("GUI_Settings/Found_Reflector/PointRadius").text)
+    highlight_radius = int(root.find("GUI_Settings/Found_Reflector/HighlightRadius").text)
+
+    return (config_created, eps, min_samples, confidence_check, min_confidence,
+            freq_weight, max_freq_threshold, lgv_div_weight, max_lgv_threshold,
+            timestamp_weight, max_time_variance, spatial_weight, max_spatial_stddev,
+            log_radius, db3_radius, reflector_radius, highlight_radius)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -433,7 +544,7 @@ class MainWindow(QMainWindow):
         self.console.setMaximumHeight(200)  # Limit height
         self.console.setStyleSheet("""
             QTextEdit {
-                background-color: #2D2D2D;
+                background-color: #323232;
                 color: #C8C8C8;
                 font-family: 'Consolas', 'Courier New', monospace;
                 font-size: 11px;
@@ -587,7 +698,6 @@ class MainWindow(QMainWindow):
         scrollbar = self.console.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-
 def apply_dark_theme(app):
     """Apply dark theme to the application"""
     dark_style = """
@@ -667,6 +777,10 @@ def apply_dark_theme(app):
 
 
 if __name__ == "__main__":
+    config_created, eps, min_samples, confidence_check, min_confidence, freq_weight, max_freq_threshold, \
+    lgv_div_weight, max_lgv_threshold, timestamp_weight, max_time_variance, spatial_weight, max_spatial_stddev, \
+    log_radius, db3_radius, reflector_radius, highlight_radius = load_configuration()
+
     app = QApplication(sys.argv)
     apply_dark_theme(app)
     

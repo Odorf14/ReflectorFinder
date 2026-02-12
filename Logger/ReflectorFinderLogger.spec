@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['Logger.py'],
+    ['C:\\Users\\nucamendi.r\\OneDrive - Elettric 80\\Documentos\\_GitProjects\\ReflectorFinder\\Logger\\Logger.py'],
     pathex=[],
     binaries=[],
-    datas=[('TcAdsDll.dll', '.')],
+    datas=[('C:\\Users\\nucamendi.r\\OneDrive - Elettric 80\\Documentos\\_GitProjects\\ReflectorFinder\\Logger\\TcAdsDllx64\\TcAdsDll.dll', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

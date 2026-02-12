@@ -80,7 +80,7 @@ def merge_nearby_reflectors(reflectors, merge_distance=100):
     return merged
 
 
-def calcConfidence(cluster_events, max_freq=30, max_lgv=10):
+def calcConfidence(cluster_events, max_freq=50, max_lgv=10, max_time_span=7200, max_spatial_std=10.0):
     """Calculate confidence score for each reflector based on events"""
     
     if not cluster_events:
@@ -103,19 +103,21 @@ def calcConfidence(cluster_events, max_freq=30, max_lgv=10):
     if len(timestamps) > 1:
         time_span = (max(timestamps) - min(timestamps)).total_seconds()
         # Penalize very short time spans (likely noise)
-        time_score = min(1.0, time_span / 7200)  # 2 hours for max score
+        time_score = min(1.0, time_span / max_time_span)  # max_time_span seconds for max score
     else:
         time_score = 0.1  # Single events get low time score
-    
+    print(f"[DEBUG] Time span: {time_span if len(timestamps) > 1 else 'N/A'} seconds, Time score: {time_score:.3f}")
+
     # 4. Add spatial consistency score
     positions = np.array([(e[2], e[3]) for e in cluster_events])
     centroid = positions.mean(axis=0)
     distances = np.linalg.norm(positions - centroid, axis=1)
-    spatial_score = 1.0 / (1.0 + distances.std() / 50.0)  # Lower if spread out
+    spatial_score = 1.0 / (1.0 + distances.std() / max_spatial_std)  # Lower if spread out
 
 
+    #print(f"[DEBUG] Confidence components - Freq: {freq_score:.3f}, LGV: {lgv_score:.3f}, Time: {time_score:.3f}, Spatial: {spatial_score:.3f}")
     # Combine scores with weights
-    confidence = (0.2 * freq_score) + (0.35 * lgv_score) + (0.25 * time_score) + (0.2 * spatial_score)
+    confidence = (0.15 * freq_score) + (0.35 * lgv_score) + (0.25 * time_score) + (0.25 * spatial_score)
     return confidence
 
 
