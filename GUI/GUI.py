@@ -91,6 +91,56 @@ class CSVLoaderThread(QThread):
         return points, events
 
 
+class DXFLoaderThread(QThread):
+    """Background thread for loading DXF files"""
+    progress = pyqtSignal(int)
+    finished_loading = pyqtSignal(list, int)  # line_data (start/end tuples), entity_count
+    
+    def __init__(self, dxf_path):
+        super().__init__()
+        self.dxf_path = dxf_path
+        
+    def run(self):
+        """Load DXF file in background - only parse data, don't create GUI objects"""
+        try:
+            # Read DXF file
+            self.progress.emit(10)
+            doc = ezdxf.readfile(self.dxf_path)
+            self.progress.emit(30)
+            
+            # Parse modelspace
+            msp = doc.modelspace()
+            
+            # Count entities first for accurate progress
+            entities = [e for e in msp if e.dxftype() == 'LINE']
+            total_entities = len(entities)
+            self.progress.emit(50)
+            
+            # Extract only coordinate data (not GUI objects)
+            line_data = []
+            entity_count = 0
+            
+            for i, entity in enumerate(entities):
+                start = entity.dxf.start
+                end = entity.dxf.end
+                # Store only the coordinates as tuples
+                line_data.append((start.x, start.y, end.x, end.y))
+                entity_count += 1
+                
+                # Update progress (50% to 90% for entity processing)
+                if i % max(1, total_entities // 40) == 0:
+                    progress_percent = 50 + int((i / total_entities) * 40)
+                    self.progress.emit(progress_percent)
+            
+            self.progress.emit(90)
+            self.finished_loading.emit(line_data, entity_count)
+            self.progress.emit(100)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to read DXF: {e}")
+            self.finished_loading.emit([], 0)
+
+
 class DXFViewer(QGraphicsView):
     def __init__(self):
         super().__init__()
@@ -113,11 +163,20 @@ class DXFViewer(QGraphicsView):
         self.csv_loader_thread = None
         self.progress_dialog = None
         
+        # DXF loading thread
+        self.dxf_loader_thread = None
+        self.dxf_path = None
+        
+        # Database layout data
+        self.layout_reflectors = []  # Store reflectors from db3
+        self.layout_freeshapes = []  # Store FreeShapes from db3
+        self.db3_loaded = False  # Flag to track if db3 has been loaded
+        
         # Initialize empty scene with dark background
         self.setBackgroundBrush(QColor(50, 50, 50))
 
     def load_dxf(self, path):
-        """Load and display DXF file"""
+        """Load and display DXF file with progress dialog"""
         print(f"[INFO] Loading DXF file: {path}")
         
         # Clear existing DXF content (keep dots)
@@ -129,39 +188,56 @@ class DXFViewer(QGraphicsView):
         for item in items_to_remove:
             self.scene.removeItem(item)
         
-        try:
-            doc = ezdxf.readfile(path)
-        except Exception as e:
-            print(f"[ERROR] Failed to read DXF: {e}")
+        # Store path for later use
+        self.dxf_path = path
+        
+        # Check if thread is already running
+        if self.dxf_loader_thread and self.dxf_loader_thread.isRunning():
+            print("[WARNING] DXF loading already in progress")
             return
         
-        print("[INFO] Parsing modelspace...")
-        msp = doc.modelspace()
+        # Show progress dialog
+        self.progress_dialog = QProgressDialog("Loading DXF file...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.show()
+        
+        # Start background loading
+        self.dxf_loader_thread = DXFLoaderThread(path)
+        self.dxf_loader_thread.progress.connect(self.progress_dialog.setValue)
+        self.dxf_loader_thread.finished_loading.connect(self.on_dxf_loaded)
+        self.dxf_loader_thread.start()
+    
+    def on_dxf_loaded(self, line_data, entity_count):
+        """Handle DXF loading completion - create GUI objects in main thread"""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+        
+        if entity_count == 0:
+            print("[WARNING] No LINE entities found in DXF file")
+            return
+        
+        print(f"[INFO] Creating {entity_count} LINE entities...")
+        
+        # Create pen for lines
         pen = QPen(QColor(100, 100, 100))
         pen.setWidth(0)
-        entity_count = 0
-
-        # Batch add items to scene for better performance
-        line_items = []
-        for entity in msp:
-            if entity.dxftype() == 'LINE':
-                start = entity.dxf.start
-                end = entity.dxf.end
-                line = QGraphicsLineItem(start.x, start.y, end.x, end.y)
-                line.setPen(pen)
-                line.setZValue(0)
-                line_items.append(line)
-                entity_count += 1
-                
-                # Add in batches to reduce overhead
-                if len(line_items) >= self.batch_size:
-                    for item in line_items:
-                        self.scene.addItem(item)
-                    line_items.clear()
         
-        # Add remaining items
-        for item in line_items:
-            self.scene.addItem(item)
+        # Create QGraphicsLineItem objects in main thread
+        line_items = []
+        for start_x, start_y, end_x, end_y in line_data:
+            line = QGraphicsLineItem(start_x, start_y, end_x, end_y)
+            line.setPen(pen)
+            line.setZValue(0)
+            line_items.append(line)
+        
+        print(f"[INFO] Adding {entity_count} LINE entities to scene...")
+        
+        # Add items to scene in batches
+        batch_size = 1000
+        for i in range(0, len(line_items), batch_size):
+            batch = line_items[i:i+batch_size]
+            for item in batch:
+                self.scene.addItem(item)
         
         print(f"[INFO] Loaded {entity_count} LINE entities.")
         
@@ -243,7 +319,8 @@ class DXFViewer(QGraphicsView):
         
     def on_all_csv_loaded(self):
         """Handle completion of all CSV loading"""
-        self.progress_dialog.close()
+        if self.progress_dialog:
+            self.progress_dialog.close()
         
         if len(self.all_points) == 0:
             print("[WARNING] No valid data loaded from any files.")
@@ -281,25 +358,44 @@ class DXFViewer(QGraphicsView):
         print("[INFO] Cleared reflector visualizations.")
 
     def load_layoutReflectors(self, db3_path):
-        """Load reflectors from db3"""
+        """Load reflectors and FreeShapes from db3"""
         conn = sqlite3.connect(db3_path)
         cursor = conn.cursor()
 
+        # Load Reflectors
         cursor.execute("SELECT ID, X, Y FROM Reflectors")
-        rows = cursor.fetchall()
+        reflector_rows = cursor.fetchall()
+        self.layout_reflectors = reflector_rows
+        
+        # Load FreeShapes
+        cursor.execute("SELECT ID, X1, X2, Y1, Y2 FROM FreeShapes")
+        freeshape_rows = cursor.fetchall()
+        self.layout_freeshapes = freeshape_rows
 
         conn.close()
-        self.visualize_layoutReflectors([(row[1], row[2]) for row in rows])
+        
+        # Set flag to indicate db3 is loaded
+        self.db3_loaded = True
+        
+        # Visualize reflectors
+        self.visualize_layoutReflectors([(row[1], row[2]) for row in reflector_rows])
+        
+        # Log FreeShapes data
+        print(f"[INFO] Loaded {len(reflector_rows)} reflectors and {len(freeshape_rows)} FreeShapes from db3")
     
     def clear_layoutReflectors(self):
-        """Clear layout reflector visualizations from the scene"""
-        print("[INFO] Clearing layout reflector visualizations...")
+        """Clear layout reflector visualizations and db3 data from the scene"""
+        print("[INFO] Clearing layout reflector visualizations and db3 data...")
         
         for item in self.layoutReflector_items:
             self.scene.removeItem(item)
         
         self.layoutReflector_items.clear()
-        print("[INFO] Cleared layout reflector visualizations.")
+        self.layout_reflectors = []
+        self.layout_freeshapes = []
+        self.db3_loaded = False
+        
+        print("[INFO] Cleared layout reflector visualizations and db3 data.")
         
     def visualize_reflectors(self, reflector_scores):
         """Create yellow circles for found reflectors with hover tooltips"""
@@ -575,8 +671,8 @@ class MainWindow(QMainWindow):
         load_dxf_action.triggered.connect(self.load_dxf_file)
         file_menu.addAction(load_dxf_action)
 
-        #Load layout reflectors action
-        load_layoutReflectors_action = QAction("Load reflectors from layout", self)
+        #Load layout db3 action
+        load_layoutReflectors_action = QAction("Load layout db3", self)
         load_layoutReflectors_action.triggered.connect(self.load_layoutReflectors_file)
         file_menu.addAction(load_layoutReflectors_action)
 
@@ -597,8 +693,8 @@ class MainWindow(QMainWindow):
         clear_reflectors_action.triggered.connect(self.viewer.clear_reflectors)
         file_menu.addAction(clear_reflectors_action)
 
-        #Clear layout reflectors action
-        clear_layoutReflectors_action = QAction("Clear Layout Reflectors", self)
+        #Clear db3 action
+        clear_layoutReflectors_action = QAction("Clear db3", self)
         clear_layoutReflectors_action.triggered.connect(self.viewer.clear_layoutReflectors)
         file_menu.addAction(clear_layoutReflectors_action)
         
@@ -612,10 +708,15 @@ class MainWindow(QMainWindow):
         # ANALYSIS MENU
         analysis_menu = menubar.addMenu("Analysis")
         
-        # Placeholder for future reflector finding functionality
-        find_reflectors_action = QAction("Find Reflectors", self)
-        find_reflectors_action.triggered.connect(self.find_reflectors_placeholder)
-        analysis_menu.addAction(find_reflectors_action)
+        # Find TC2 Reflectors
+        find_tc2_reflectors_action = QAction("Find TC2 Reflectors", self)
+        find_tc2_reflectors_action.triggered.connect(self.find_tc2_reflectors)
+        analysis_menu.addAction(find_tc2_reflectors_action)
+        
+        # Find TC3 Reflectors
+        find_tc3_reflectors_action = QAction("Find TC3 Reflectors", self)
+        find_tc3_reflectors_action.triggered.connect(self.find_reflectors_placeholder)
+        analysis_menu.addAction(find_tc3_reflectors_action)
         
         # Reload configuration action
         reload_config_action = QAction("Reload configuration", self)
@@ -679,11 +780,24 @@ class MainWindow(QMainWindow):
             self.viewer.load_csv_files_async(file_paths)
 
     def load_layoutReflectors_file(self):
-        """Load reflectors from db3"""
+        """Load reflectors and FreeShapes from db3"""
 
         file_path, _ = QFileDialog.getOpenFileName(self, "Open Layout.db3", "", "DB3 Files (*.db3)")
         if file_path:
             self.viewer.load_layoutReflectors(file_path)
+    
+    def find_tc2_reflectors(self):
+        """Find TC2 Reflectors - placeholder for future implementation"""
+        if not self.viewer.db3_loaded:
+            warning_msg = "[WARNING] Load layout db3 first before finding TC2 reflectors."
+            print(warning_msg)
+            self.log_to_console(warning_msg)
+            return
+        
+        # Placeholder for future TC2 reflector finding logic
+        info_msg = "[INFO] TC2 Reflector finding functionality will be implemented here."
+        print(info_msg)
+        self.log_to_console(info_msg)
             
     def find_reflectors_placeholder(self):
         """Run reflector finding analysis and display results"""
@@ -806,12 +920,18 @@ def apply_dark_theme(app):
     }
     QProgressDialog {
         background-color: #2E2E2E;
-        color: white;
+        color: #E0E0E0;
+    }
+    QProgressDialog QLabel {
+        color: #E0E0E0;
+        font-size: 10pt;
     }
     QProgressBar {
         background-color: #3A3A3A;
-        color: white;
+        color: #E0E0E0;
         text-align: center;
+        font-size: 10pt;
+        font-weight: bold;
     }
     QProgressBar::chunk {
         background-color: #505050;
