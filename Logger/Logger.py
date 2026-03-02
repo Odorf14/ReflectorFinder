@@ -324,6 +324,9 @@ def generate_configfile():
     lgvPosY = ET.SubElement(symbols_tc3, "LgvPosY")
     ET.SubElement(lgvPosY, "Symbol").text = "LibraryInterfaces.LGV.Guid.Info.Pos.Y"
 
+    reflectors = ET.SubElement(symbols_tc3, "Reflectors")
+    ET.SubElement(reflectors, "Symbol").text = "Sys_ExternalLocalization.extReflectorSet[1].reflectors"
+
     #==========TC2==========
     symbols_tc2 = ET.SubElement(root, "TC2_Symbols")
     
@@ -463,6 +466,8 @@ def main():
         if not isNotMoving_bypass: isNotMoving_symbol = plc.get_symbol(symbols_tc3["IsNotMoving"][0])
         LgvPosX_symbol = plc.get_symbol(symbols_tc3["LgvPosX"][0])
         LgvPosY_symbol = plc.get_symbol(symbols_tc3["LgvPosY"][0])
+        #reflectors_symbol = plc.get_symbol(symbols_tc3["Reflectors"][0])
+        
     
     else:
         quality_bypass = symbols_tc2["Quality"][1]
@@ -535,8 +540,12 @@ def main():
                         raw_assoc = plc.read_by_name(assoc_reflector_symbol, ctypes.c_ubyte * assoc_size)
 
                     else:
+                        #raw_data_list = plc.read_by_name(
+                        #    "Sys_ExternalLocalization.extReflectorSet[1].reflectors",
+                        #    ctypes.c_ubyte * (ctypes.sizeof(ReflectorInfo) * NumReflectors)
+                        #)
                         raw_data_list = plc.read_by_name(
-                            "Sys_ExternalLocalization.extReflectorSet[1].reflectors",
+                            symbols_tc3["Reflectors"][0],
                             ctypes.c_ubyte * (ctypes.sizeof(ReflectorInfo) * NumReflectors)
                         )
                 else:
