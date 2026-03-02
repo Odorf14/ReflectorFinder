@@ -616,11 +616,55 @@ class MainWindow(QMainWindow):
         find_reflectors_action = QAction("Find Reflectors", self)
         find_reflectors_action.triggered.connect(self.find_reflectors_placeholder)
         analysis_menu.addAction(find_reflectors_action)
+        
+        # Reload configuration action
+        reload_config_action = QAction("Reload configuration", self)
+        reload_config_action.triggered.connect(self.reload_configuration)
+        analysis_menu.addAction(reload_config_action)
 
     def clear_console(self):
         """Clear the console output area"""
         self.console.clear()
         self.console.setPlainText("Console Output:\n" + "="*50)
+    
+    def reload_configuration(self):
+        """Reload configuration from XML file"""
+        start_msg = "[INFO] Reloading configuration..."
+        print(start_msg)
+        self.log_to_console(start_msg)
+        
+        try:
+            # Call load_configuration to reload settings
+            config_created, eps, min_samples, confidence_check, min_confidence, freq_weight, max_freq_threshold, \
+            lgv_div_weight, max_lgv_threshold, timestamp_weight, max_time_variance, spatial_weight, max_spatial_stddev, \
+            log_radius, db3_radius, reflector_radius, highlight_radius = load_configuration()
+            
+            # Update global variables (if needed in the future)
+            globals()['eps'] = eps
+            globals()['min_samples'] = min_samples
+            globals()['confidence_check'] = confidence_check
+            globals()['min_confidence'] = min_confidence
+            globals()['freq_weight'] = freq_weight
+            globals()['max_freq_threshold'] = max_freq_threshold
+            globals()['lgv_div_weight'] = lgv_div_weight
+            globals()['max_lgv_threshold'] = max_lgv_threshold
+            globals()['timestamp_weight'] = timestamp_weight
+            globals()['max_time_variance'] = max_time_variance
+            globals()['spatial_weight'] = spatial_weight
+            globals()['max_spatial_stddev'] = max_spatial_stddev
+            globals()['log_radius'] = log_radius
+            globals()['db3_radius'] = db3_radius
+            globals()['reflector_radius'] = reflector_radius
+            globals()['highlight_radius'] = highlight_radius
+            
+            success_msg = "[INFO] Configuration reloaded successfully."
+            print(success_msg)
+            self.log_to_console(success_msg)
+            
+        except Exception as e:
+            error_msg = f"[ERROR] Failed to reload configuration: {e}"
+            print(error_msg)
+            self.log_to_console(error_msg)
 
     def load_dxf_file(self):
         """Load DXF file via file dialog"""
@@ -658,7 +702,7 @@ class MainWindow(QMainWindow):
         reflector_scores = analyzeReflectors(
             self.viewer.all_points, 
             self.viewer.all_events,
-            confidence_threshold=0.8,
+            confidence_threshold=min_confidence,
             offset_correction=False
         )
         
