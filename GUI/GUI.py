@@ -1,5 +1,4 @@
 import sys
-import ezdxf
 import csv
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QAction,
@@ -199,57 +198,9 @@ class CSVLoaderThreadTC2(QThread):
         return points, events
 
 
-class DXFLoaderThread(QThread):
-    """Background thread for loading DXF files"""
-    progress = pyqtSignal(int)
-    finished_loading = pyqtSignal(list, int)  # line_data (start/end tuples), entity_count
-    
-    def __init__(self, dxf_path):
-        super().__init__()
-        self.dxf_path = dxf_path
-        
-    def run(self):
-        """Load DXF file in background - only parse data, don't create GUI objects"""
-        try:
-            # Read DXF file
-            self.progress.emit(10)
-            doc = ezdxf.readfile(self.dxf_path)
-            self.progress.emit(30)
-            
-            # Parse modelspace
-            msp = doc.modelspace()
-            
-            # Count entities first for accurate progress
-            entities = [e for e in msp if e.dxftype() == 'LINE']
-            total_entities = len(entities)
-            self.progress.emit(50)
-            
-            # Extract only coordinate data (not GUI objects)
-            line_data = []
-            entity_count = 0
-            
-            for i, entity in enumerate(entities):
-                start = entity.dxf.start
-                end = entity.dxf.end
-                # Store only the coordinates as tuples
-                line_data.append((start.x, start.y, end.x, end.y))
-                entity_count += 1
-                
-                # Update progress (50% to 90% for entity processing)
-                if i % max(1, total_entities // 40) == 0:
-                    progress_percent = 50 + int((i / total_entities) * 40)
-                    self.progress.emit(progress_percent)
-            
-            self.progress.emit(90)
-            self.finished_loading.emit(line_data, entity_count)
-            self.progress.emit(100)
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to read DXF: {e}")
-            self.finished_loading.emit([], 0)
-
-
 class DXFViewer(QGraphicsView):
+    status_updated = pyqtSignal(str)  # Emitted to push messages to the console
+
     def __init__(self):
         super().__init__()
         self.all_events = []
@@ -272,97 +223,30 @@ class DXFViewer(QGraphicsView):
         self.csv_loader_thread_tc2 = None
         self.progress_dialog = None
         
-        # DXF loading thread
-        self.dxf_loader_thread = None
-        self.dxf_path = None
-        
         # Database layout data
         self.layout_reflectors = []  # Store reflectors from db3
         self.layout_freeshapes = []  # Store FreeShapes from db3
+        self.background_items = []   # Store background geometry items from db3
         self.db3_loaded = False  # Flag to track if db3 has been loaded
+
+        # Drawing sizes – overridden by MainWindow after construction
+        self.log_radius = 15
+        self.db3_radius = 100
+        self.reflector_radius = 32
+        self.highlight_radius = 1750
         
         # Initialize empty scene with dark background
         self.setBackgroundBrush(QColor(50, 50, 50))
 
-    def load_dxf(self, path):
-        """Load and display DXF file with progress dialog"""
-        print(f"[INFO] Loading DXF file: {path}")
-        
-        # Clear existing DXF content (keep dots)
-        items_to_remove = []
-        for item in self.scene.items():
-            if isinstance(item, QGraphicsLineItem):
-                items_to_remove.append(item)
-        
-        for item in items_to_remove:
-            self.scene.removeItem(item)
-        
-        # Store path for later use
-        self.dxf_path = path
-        
-        # Check if thread is already running
-        if self.dxf_loader_thread and self.dxf_loader_thread.isRunning():
-            print("[WARNING] DXF loading already in progress")
-            return
-        
-        # Show progress dialog
-        self.progress_dialog = QProgressDialog("Loading DXF file...", "Cancel", 0, 100, self)
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
-        self.progress_dialog.show()
-        
-        # Start background loading
-        self.dxf_loader_thread = DXFLoaderThread(path)
-        self.dxf_loader_thread.progress.connect(self.progress_dialog.setValue)
-        self.dxf_loader_thread.finished_loading.connect(self.on_dxf_loaded)
-        self.dxf_loader_thread.start()
-    
-    def on_dxf_loaded(self, line_data, entity_count):
-        """Handle DXF loading completion - create GUI objects in main thread"""
-        if self.progress_dialog:
-            self.progress_dialog.close()
-        
-        if entity_count == 0:
-            print("[WARNING] No LINE entities found in DXF file")
-            return
-        
-        print(f"[INFO] Creating {entity_count} LINE entities...")
-        
-        # Create pen for lines
-        pen = QPen(QColor(100, 100, 100))
-        pen.setWidth(0)
-        
-        # Create QGraphicsLineItem objects in main thread
-        line_items = []
-        for start_x, start_y, end_x, end_y in line_data:
-            line = QGraphicsLineItem(start_x, start_y, end_x, end_y)
-            line.setPen(pen)
-            line.setZValue(0)
-            line_items.append(line)
-        
-        print(f"[INFO] Adding {entity_count} LINE entities to scene...")
-        
-        # Add items to scene in batches
-        batch_size = 1000
-        for i in range(0, len(line_items), batch_size):
-            batch = line_items[i:i+batch_size]
-            for item in batch:
-                self.scene.addItem(item)
-        
-        print(f"[INFO] Loaded {entity_count} LINE entities.")
-        
-        bbox = self.scene.itemsBoundingRect()
-        print(f"[DEBUG] Scene bounds: {bbox}")
-        
-        self.resetTransform()
-        self.fitInView(bbox, Qt.KeepAspectRatio)
-        self.setTransform(self.transform().scale(1, -1))
-        print("[INFO] DXF loading complete.")
-        
     def load_csv_files_async(self, csv_paths):
         """Load multiple CSV files asynchronously with progress dialog (TC3)"""
         if self.csv_loader_thread and self.csv_loader_thread.isRunning():
             return
         
+        msg = f"[INFO] Loading {len(csv_paths)} TC3 log file(s)..."
+        print(msg)
+        self.status_updated.emit(msg)
+
         # Show progress dialog
         self.progress_dialog = QProgressDialog("Loading CSV files (TC3)...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
@@ -380,6 +264,10 @@ class DXFViewer(QGraphicsView):
         if self.csv_loader_thread_tc2 and self.csv_loader_thread_tc2.isRunning():
             return
         
+        msg = f"[INFO] Loading {len(csv_paths)} TC2 log file(s) with layer filtering..."
+        print(msg)
+        self.status_updated.emit(msg)
+
         # Show progress dialog
         self.progress_dialog = QProgressDialog("Loading CSV files (TC2 with filtering)...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
@@ -394,7 +282,10 @@ class DXFViewer(QGraphicsView):
         
     def on_csv_file_loaded(self, filename, points, events, correct_points = False):
         """Handle individual CSV file loaded"""
-        print(f"[INFO] Processing {filename} with {len(points)} points...")
+        short_name = os.path.basename(filename)
+        msg = f"[INFO] Loaded {short_name}: {len(points)} points."
+        print(msg)
+        self.status_updated.emit(msg)
         
         # Store points for future analysis
         if len(self.all_points) == 0:
@@ -413,7 +304,7 @@ class DXFViewer(QGraphicsView):
         
     def create_red_dots(self, points):
         """Create small red dots for all points"""
-        dot_radius = 15  # Smaller radius for dense data
+        dot_radius = self.log_radius
         dot_pen = QPen()
         dot_pen.setWidth(0)
         
@@ -449,21 +340,25 @@ class DXFViewer(QGraphicsView):
             self.progress_dialog.close()
         
         if len(self.all_points) == 0:
-            print("[WARNING] No valid data loaded from any files.")
+            msg = "[WARNING] No valid data loaded from any files."
+            print(msg)
+            self.status_updated.emit(msg)
             return
         
         # Fit view to show all data
         bbox = self.scene.itemsBoundingRect()
         self.fitInView(bbox, Qt.KeepAspectRatio)
         
-        print(f"[INFO] Loaded total of {len(self.all_points)} data points from all files.")
+        msg = f"[INFO] Done. Total logged points loaded: {len(self.all_points):,}."
+        print(msg)
+        self.status_updated.emit(msg)
 
     def clear_dots(self):
         """Clear all dots from the scene"""
-        print("[INFO] Clearing dots...")
+        count = len(self.dot_items)
         
         # Remove dot items in batches for better performance
-        for i in range(0, len(self.dot_items), self.batch_size):
+        for i in range(0, count, self.batch_size):
             batch = self.dot_items[i:i + self.batch_size]
             for item in batch:
                 self.scene.removeItem(item)
@@ -471,57 +366,192 @@ class DXFViewer(QGraphicsView):
         self.dot_items.clear()
         self.all_points = np.array([], dtype=np.float32)
         self.all_events.clear()
-        print("[INFO] Cleared all dots and stored data.")
+
+        msg = f"[INFO] Cleared {count:,} logged points."
+        print(msg)
+        self.status_updated.emit(msg)
         
     def clear_reflectors(self):
         """Clear reflector visualizations from the scene"""
-        print("[INFO] Clearing reflector visualizations...")
-        
+        count = len(self.reflector_items)
         for item in self.reflector_items:
             self.scene.removeItem(item)
-        
         self.reflector_items.clear()
-        print("[INFO] Cleared reflector visualizations.")
 
-    def load_layoutReflectors(self, db3_path):
-        """Load reflectors and FreeShapes from db3"""
-        conn = sqlite3.connect(db3_path)
-        cursor = conn.cursor()
+        msg = f"[INFO] Cleared {count} found reflector markers."
+        print(msg)
+        self.status_updated.emit(msg)
 
-        # Load Reflectors
-        cursor.execute("SELECT ID, X, Y FROM Reflectors")
-        reflector_rows = cursor.fetchall()
-        self.layout_reflectors = reflector_rows
-        
-        # Load FreeShapes
-        cursor.execute("SELECT ID, X1, X2, Y1, Y2 FROM FreeShapes")
-        freeshape_rows = cursor.fetchall()
-        self.layout_freeshapes = freeshape_rows
+    def load_layout(self, db3_path):
+        """Load reflectors, FreeShapes and background geometry from db3"""
+        # Auto-clear any previously loaded layout before loading a new one
+        if self.db3_loaded:
+            self.clear_layout()
 
-        conn.close()
-        
-        # Set flag to indicate db3 is loaded
+        label = os.path.basename(db3_path)
+
+        # Progress dialog – 4 steps: Reflectors, FreeShapes, Background, Fit
+        progress = QProgressDialog(f"Loading layout: {label}", None, 0, 4, self.window())
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        try:
+            conn = sqlite3.connect(db3_path)
+            cursor = conn.cursor()
+
+            progress.setLabelText("Loading reflectors...")
+            progress.setValue(1)
+            QApplication.processEvents()
+            cursor.execute("SELECT ID, X, Y FROM Reflectors")
+            reflector_rows = cursor.fetchall()
+            self.layout_reflectors = reflector_rows
+
+            progress.setLabelText("Loading layers (FreeShapes)...")
+            progress.setValue(2)
+            QApplication.processEvents()
+            cursor.execute("SELECT ID, X1, X2, Y1, Y2 FROM FreeShapes")
+            freeshape_rows = cursor.fetchall()
+            self.layout_freeshapes = freeshape_rows
+
+            progress.setLabelText("Loading background geometry...")
+            progress.setValue(3)
+            QApplication.processEvents()
+            self.load_background_from_db(conn)
+
+            conn.close()
+        except Exception as e:
+            progress.close()
+            msg = f"[ERROR] Failed to load layout: {e}"
+            print(msg)
+            self.status_updated.emit(msg)
+            return
+
         self.db3_loaded = True
-        
-        # Visualize reflectors
-        self.visualize_layoutReflectors([(row[1], row[2]) for row in reflector_rows])
-        
-        # Log FreeShapes data
-        print(f"[INFO] Loaded {len(reflector_rows)} reflectors and {len(freeshape_rows)} FreeShapes from db3")
+        self.visualize_layout_reflectors([(row[1], row[2]) for row in reflector_rows])
+
+        progress.setLabelText("Fitting view...")
+        progress.setValue(4)
+        QApplication.processEvents()
+
+        bbox = self.scene.itemsBoundingRect()
+        if not bbox.isEmpty():
+            margin = max(bbox.width(), bbox.height()) * 5
+            self.scene.setSceneRect(bbox.adjusted(-margin, -margin, margin, margin))
+            self.resetTransform()
+            self.fitInView(bbox, Qt.KeepAspectRatio)
+            self.setTransform(self.transform().scale(1, -1))
+            self.centerOn(bbox.center())
+
+        progress.close()
+
+        msg = (
+            f"[INFO] Layout loaded: {len(reflector_rows)} reflectors, "
+            f"{len(freeshape_rows)} layers, "
+            f"{len(self.background_items)} background entities."
+        )
+        print(msg)
+        self.status_updated.emit(msg)
     
-    def clear_layoutReflectors(self):
-        """Clear layout reflector visualizations and db3 data from the scene"""
-        print("[INFO] Clearing layout reflector visualizations and db3 data...")
-        
+    def clear_layout_reflectors(self):
+        """Clear only the blue db3 reflector dots, keeping background geometry"""
+        count = len(self.layoutReflector_items)
         for item in self.layoutReflector_items:
             self.scene.removeItem(item)
-        
         self.layoutReflector_items.clear()
+
+        msg = f"[INFO] Cleared {count} db3 reflector markers."
+        print(msg)
+        self.status_updated.emit(msg)
+
+    def clear_layout(self):
+        """Clear layout reflector visualizations, background geometry and db3 data from the scene"""
+        n_reflectors = len(self.layoutReflector_items)
+        n_bg = len(self.background_items)
+
+        for item in self.layoutReflector_items:
+            self.scene.removeItem(item)
+        self.layoutReflector_items.clear()
+
+        for item in self.background_items:
+            self.scene.removeItem(item)
+        self.background_items.clear()
+
         self.layout_reflectors = []
         self.layout_freeshapes = []
         self.db3_loaded = False
-        
-        print("[INFO] Cleared layout reflector visualizations and db3 data.")
+
+        msg = f"[INFO] Layout cleared ({n_reflectors} reflector markers, {n_bg} background entities removed)."
+        print(msg)
+        self.status_updated.emit(msg)
+
+    def load_background_from_db(self, conn):
+        """Load and draw background geometry from BackGround and DxfPolylinePoints tables"""
+        pen = QPen(QColor(170, 170, 170))
+        pen.setWidth(0)
+
+        counts = {1: 0, 2: 0, 3: 0, 4: 0}
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT Type, Data1, Data2, Data3, Data4, Data5 FROM BackGround")
+            rows = cursor.fetchall()
+        except Exception as e:
+            print(f"[ERROR] Failed to query BackGround table: {e}")
+            return
+
+        for row in rows:
+            entity_type, d1, d2, d3, d4, d5 = row
+            try:
+                if entity_type == 1:
+                    # Line: (X1, Y1) -> (X2, Y2)
+                    item = self.scene.addLine(float(d1), float(d2), float(d3), float(d4), pen)
+                    item.setZValue(0)
+                    self.background_items.append(item)
+                    counts[1] += 1
+                elif entity_type == 2:
+                    # Circle: center (d1, d2), radius d3
+                    cx, cy, r = float(d1), float(d2), float(d3)
+                    item = self.scene.addEllipse(cx - r, cy - r, 2 * r, 2 * r, pen)
+                    item.setZValue(0)
+                    self.background_items.append(item)
+                    counts[2] += 1
+                elif entity_type == 3:
+                    # Polyline: first PointId = d2, num points = d3
+                    self._draw_bg_polyline(conn, int(d2), int(d3), pen)
+                    counts[3] += 1
+                elif entity_type == 4:
+                    # Insert: skip
+                    counts[4] += 1
+            except Exception as e:
+                print(f"[ERROR] BackGround entity type {entity_type}: {e}")
+
+        print(
+            f"[INFO] Background geometry: Lines={counts[1]}, Circles={counts[2]}, "
+            f"Polylines={counts[3]}, Inserts(skipped)={counts[4]}"
+        )
+
+    def _draw_bg_polyline(self, conn, first_point_id, num_points, pen):
+        """Query DxfPolylinePoints and draw consecutive line segments"""
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT X, Y FROM DxfPolylinePoints "
+                "WHERE PointId >= ? AND PointId < ? ORDER BY PointId",
+                (first_point_id, first_point_id + num_points),
+            )
+            points = cursor.fetchall()
+        except Exception as e:
+            print(f"[ERROR] DxfPolylinePoints query failed: {e}")
+            return
+
+        for i in range(len(points) - 1):
+            x1, y1 = float(points[i][0]),     float(points[i][1])
+            x2, y2 = float(points[i + 1][0]), float(points[i + 1][1])
+            item = self.scene.addLine(x1, y1, x2, y2, pen)
+            item.setZValue(0)
+            self.background_items.append(item)
         
     def visualize_reflectors(self, reflector_scores):
         """Create yellow circles for found reflectors with hover tooltips"""
@@ -532,8 +562,8 @@ class DXFViewer(QGraphicsView):
             print("[INFO] No reflectors to visualize.")
             return
         
-        circle_radius = 1750  # Radius for reflector circles
-        center_dot_radius = 32  # Small white center dot - actual reflector
+        circle_radius = self.highlight_radius
+        center_dot_radius = self.reflector_radius
         
         yellow_color = QColor(255, 255, 0, 100)  # Semi-transparent yellow
         yellow_pen = QPen(QColor(255, 255, 0, 200), 3)  # Yellow border
@@ -543,7 +573,6 @@ class DXFViewer(QGraphicsView):
         
         for cluster_id, centroid, confidence in reflector_scores:
             x, y = centroid[0], centroid[1]
-            
             # Create main yellow circle
             circle = QGraphicsEllipseItem(
                 x - circle_radius, y - circle_radius,
@@ -576,11 +605,13 @@ class DXFViewer(QGraphicsView):
             self.reflector_items.append(circle)
             self.reflector_items.append(center_dot)
         
-        print(f"[INFO] Visualized {len(reflector_scores)} reflectors as yellow circles with white centers.")
+        msg = f"[INFO] Found reflectors visualized: {len(reflector_scores)} candidate(s)."
+        print(msg)
+        self.status_updated.emit(msg)
         
-    def visualize_layoutReflectors(self, layoutReflectors):
+    def visualize_layout_reflectors(self, layout_reflectors):
         """Create blue dots for layout reflectors"""
-        dot_radius = 100
+        dot_radius = self.db3_radius
         dot_pen = QPen()
         dot_pen.setWidth(0)
         
@@ -591,7 +622,7 @@ class DXFViewer(QGraphicsView):
         # Create dots in batches
         layoutReflector_items_to_add = []
         
-        for x, y in layoutReflectors:
+        for x, y in layout_reflectors:
             ellipse = QGraphicsEllipseItem(x - dot_radius / 2, y - dot_radius / 2, dot_radius, dot_radius)
             ellipse.setPen(dot_pen)
             ellipse.setBrush(blue_color)
@@ -610,24 +641,36 @@ class DXFViewer(QGraphicsView):
         for item in layoutReflector_items_to_add:
             self.scene.addItem(item)
 
+        msg = f"[INFO] Layout reflectors drawn: {len(layout_reflectors)} marker(s)."
+        print(msg)
+        self.status_updated.emit(msg)
+
 
     def wheelEvent(self, event):
-        """Handle mouse wheel zoom with proper anchor point"""
-        # Get the position of the mouse in scene coordinates
+        """Handle mouse wheel zoom anchored to the mouse pointer (free zoom)"""
+        # Snapshot mouse position in scene space before scaling
         old_pos = self.mapToScene(event.pos())
 
-        # Zoom factor
         zoom_factor = 1.25 if event.angleDelta().y() > 0 else 0.8
 
-        # Apply zoom
+        # Scale with no view anchor so we control panning manually
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setResizeAnchor(QGraphicsView.NoAnchor)
         self.scale(zoom_factor, zoom_factor)
 
-        # After zoom, map the mouse position again and pan to keep it stable
+        # Translate so the scene point under the mouse stays fixed
         new_pos = self.mapToScene(event.pos())
         delta = new_pos - old_pos
         self.translate(delta.x(), delta.y())
+
+        # Expand the scene rect to prevent Qt from snapping/re-centering
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        current = self.sceneRect()
+        if not current.contains(visible):
+            self.setSceneRect(current.united(visible).adjusted(
+                -current.width(), -current.height(),
+                current.width(), current.height()
+            ))
 
 def get_config_path():
     if getattr(sys, 'frozen', False):
@@ -758,6 +801,12 @@ class MainWindow(QMainWindow):
         
         # Create and add viewer to top part of splitter
         self.viewer = DXFViewer()
+        self.viewer.status_updated.connect(self.log_to_console)
+        # Apply initial config sizes to the viewer
+        self.viewer.log_radius      = log_radius
+        self.viewer.db3_radius      = db3_radius
+        self.viewer.reflector_radius = reflector_radius
+        self.viewer.highlight_radius = highlight_radius
         self.splitter.addWidget(self.viewer)
         
         # Create console output area
@@ -792,15 +841,10 @@ class MainWindow(QMainWindow):
         # FILE MENU
         file_menu = menubar.addMenu("File")
 
-        # Load DXF action
-        load_dxf_action = QAction("Load DXF", self)
-        load_dxf_action.triggered.connect(self.load_dxf_file)
-        file_menu.addAction(load_dxf_action)
-
         #Load layout db3 action
-        load_layoutReflectors_action = QAction("Load layout db3", self)
-        load_layoutReflectors_action.triggered.connect(self.load_layoutReflectors_file)
-        file_menu.addAction(load_layoutReflectors_action)
+        load_layout_action = QAction("Load layout", self)
+        load_layout_action.triggered.connect(self.load_layout_file)
+        file_menu.addAction(load_layout_action)
 
         # Load CSV TC3 action
         load_csv_tc3_action = QAction("Load Logs TC3", self)
@@ -825,9 +869,14 @@ class MainWindow(QMainWindow):
         file_menu.addAction(clear_reflectors_action)
 
         #Clear db3 action
-        clear_layoutReflectors_action = QAction("Clear db3", self)
-        clear_layoutReflectors_action.triggered.connect(self.viewer.clear_layoutReflectors)
-        file_menu.addAction(clear_layoutReflectors_action)
+        clear_layout_action = QAction("Clear layout", self)
+        clear_layout_action.triggered.connect(self.viewer.clear_layout)
+        file_menu.addAction(clear_layout_action)
+
+        # Clear db3 reflectors only action
+        clear_layout_reflectors_action = QAction("Clear db3 reflectors", self)
+        clear_layout_reflectors_action.triggered.connect(self.viewer.clear_layout_reflectors)
+        file_menu.addAction(clear_layout_reflectors_action)
         
         file_menu.addSeparator()
         
@@ -888,6 +937,12 @@ class MainWindow(QMainWindow):
             globals()['db3_radius'] = db3_radius
             globals()['reflector_radius'] = reflector_radius
             globals()['highlight_radius'] = highlight_radius
+
+            # Push new sizes into the viewer so next draw uses them
+            self.viewer.log_radius       = log_radius
+            self.viewer.db3_radius       = db3_radius
+            self.viewer.reflector_radius = reflector_radius
+            self.viewer.highlight_radius = highlight_radius
             
             success_msg = "[INFO] Configuration reloaded successfully."
             print(success_msg)
@@ -897,12 +952,6 @@ class MainWindow(QMainWindow):
             error_msg = f"[ERROR] Failed to reload configuration: {e}"
             print(error_msg)
             self.log_to_console(error_msg)
-
-    def load_dxf_file(self):
-        """Load DXF file via file dialog"""
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open DXF File", "", "DXF Files (*.dxf)")
-        if file_path:
-            self.viewer.load_dxf(file_path)
 
     def load_csv_files_tc3(self):
         """Load multiple CSV files using optimized async loader (TC3 - no filtering)"""
@@ -914,7 +963,7 @@ class MainWindow(QMainWindow):
         """Load multiple CSV files with TC2 layer-based filtering"""
         # Check if db3 has been loaded
         if not self.viewer.db3_loaded:
-            error_msg = "[ERROR] Load layout db3 first before loading TC2 logs."
+            error_msg = "[ERROR] Load layout first before loading TC2 logs."
             print(error_msg)
             self.log_to_console(error_msg)
             return
@@ -923,17 +972,16 @@ class MainWindow(QMainWindow):
         if file_paths:
             self.viewer.load_csv_files_async_tc2(file_paths)
 
-    def load_layoutReflectors_file(self):
-        """Load reflectors and FreeShapes from db3"""
-
+    def load_layout_file(self):
+        """Load layout reflectors, FreeShapes and background from db3"""
         file_path, _ = QFileDialog.getOpenFileName(self, "Open Layout.db3", "", "DB3 Files (*.db3)")
         if file_path:
-            self.viewer.load_layoutReflectors(file_path)
+            self.viewer.load_layout(file_path)
     
     def find_tc2_reflectors(self):
         """Find TC2 Reflectors - placeholder for future implementation"""
         if not self.viewer.db3_loaded:
-            warning_msg = "[WARNING] Load layout db3 first before finding TC2 reflectors."
+            warning_msg = "[WARNING] Load layout first before finding TC2 reflectors."
             print(warning_msg)
             self.log_to_console(warning_msg)
             return
