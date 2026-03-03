@@ -91,6 +91,114 @@ class CSVLoaderThread(QThread):
         return points, events
 
 
+class CSVLoaderThreadTC2(QThread):
+    """Background thread for loading CSV files with TC2 filtering (layer-based)"""
+    progress = pyqtSignal(int)
+    file_loaded = pyqtSignal(str, list, list)  # filename, points, events
+    finished_loading = pyqtSignal()
+    
+    def __init__(self, file_paths, freeshapes):
+        super().__init__()
+        self.file_paths = file_paths
+        self.freeshapes = freeshapes  # List of (ID, X1, X2, Y1, Y2)
+        
+    def run(self):
+        total_files = len(self.file_paths)
+        
+        for i, csv_path in enumerate(self.file_paths):
+            points, events = self.load_single_csv_with_filter(csv_path)
+            if points:  # Only emit if data was loaded
+                self.file_loaded.emit(csv_path, points, events)
+            
+            progress_percent = int((i + 1) * 100 / total_files)
+            self.progress.emit(progress_percent)
+        
+        self.finished_loading.emit()
+    
+    def point_in_freeshape(self, x, y, x1, x2, y1, y2):
+        """Check if point (x, y) is inside the rectangle defined by (x1, x2, y1, y2)"""
+        min_x = min(x1, x2)
+        max_x = max(x1, x2)
+        min_y = min(y1, y2)
+        max_y = max(y1, y2)
+        return min_x <= x <= max_x and min_y <= y <= max_y
+    
+    def find_containing_freeshape(self, x, y):
+        """Find the FreeShape ID that contains point (x, y), returns None if not found"""
+        for freeshape in self.freeshapes:
+            shape_id, x1, x2, y1, y2 = freeshape
+            if self.point_in_freeshape(x, y, x1, x2, y1, y2):
+                return shape_id
+        return None
+    
+    def load_single_csv_with_filter(self, csv_path):
+        """Load CSV data with TC2 filtering based on FreeShapes"""
+        points = []
+        events = []
+
+        try:
+            with open(csv_path, 'r', newline='') as csvfile:
+                reader = csv.DictReader(csvfile)
+                
+                # Check if we have the expected columns
+                if reader.fieldnames:
+                    expected_cols = ["Lgv", "Timestamp", "WorldX", "WorldY", "LgvX", "LgvY"]
+                    missing_cols = [col for col in expected_cols if col not in reader.fieldnames]
+                    if missing_cols:
+                        print(f"[WARNING] Missing columns in {csv_path}: {missing_cols}")
+                        print(f"[DEBUG] Available columns: {reader.fieldnames}")
+                
+                row_count = 0
+                valid_rows = 0
+                filtered_rows = 0
+                
+                # Process rows efficiently
+                for row in reader:
+                    row_count += 1
+                    try:
+                        lgv_id = int(row['Lgv'])
+                        timestamp = row['Timestamp']
+                        worldx = float(row['WorldX'])
+                        worldy = float(row['WorldY'])
+                        lgvx = float(row['LgvX'])
+                        lgvy = float(row['LgvY'])
+                        
+                        # TC2 Filtering: Check if LGV position and detected reflector are in same layer
+                        lgv_layer = self.find_containing_freeshape(lgvx, lgvy)
+                        
+                        if lgv_layer is not None:
+                            # LGV is in a layer, check if detected reflector is in the same layer
+                            reflector_layer = self.find_containing_freeshape(worldx, worldy)
+                            
+                            if reflector_layer == lgv_layer:
+                                # Both in same layer, keep the point
+                                points.append((worldx, worldy))
+                                events.append((lgv_id, timestamp, worldx, worldy, lgvx, lgvy))
+                                valid_rows += 1
+                            else:
+                                filtered_rows += 1
+                        else:
+                            # LGV not in any layer, filter out
+                            filtered_rows += 1
+                        
+                    except (ValueError, KeyError) as e:
+                        # Log first few errors for debugging
+                        if row_count <= 3:
+                            print(f"[DEBUG] Row {row_count} error in {csv_path}: {e}")
+                            print(f"[DEBUG] Row data: {dict(row)}")
+                        continue
+                
+                if row_count > 0:
+                    print(f"[INFO] {csv_path}: {valid_rows}/{row_count} valid rows (filtered out: {filtered_rows})")
+                else:
+                    print(f"[WARNING] {csv_path}: No rows found in file")
+                        
+        except Exception as e:
+            print(f"[ERROR] Failed to load {csv_path}: {e}")
+            
+        return points, events
+
+
 class DXFLoaderThread(QThread):
     """Background thread for loading DXF files"""
     progress = pyqtSignal(int)
@@ -161,6 +269,7 @@ class DXFViewer(QGraphicsView):
         
         # CSV loading thread
         self.csv_loader_thread = None
+        self.csv_loader_thread_tc2 = None
         self.progress_dialog = None
         
         # DXF loading thread
@@ -250,12 +359,12 @@ class DXFViewer(QGraphicsView):
         print("[INFO] DXF loading complete.")
         
     def load_csv_files_async(self, csv_paths):
-        """Load multiple CSV files asynchronously with progress dialog"""
+        """Load multiple CSV files asynchronously with progress dialog (TC3)"""
         if self.csv_loader_thread and self.csv_loader_thread.isRunning():
             return
         
         # Show progress dialog
-        self.progress_dialog = QProgressDialog("Loading CSV files...", "Cancel", 0, 100, self)
+        self.progress_dialog = QProgressDialog("Loading CSV files (TC3)...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.show()
         
@@ -265,6 +374,23 @@ class DXFViewer(QGraphicsView):
         self.csv_loader_thread.file_loaded.connect(self.on_csv_file_loaded)
         self.csv_loader_thread.finished_loading.connect(self.on_all_csv_loaded)
         self.csv_loader_thread.start()
+    
+    def load_csv_files_async_tc2(self, csv_paths):
+        """Load multiple CSV files with TC2 filtering (layer-based)"""
+        if self.csv_loader_thread_tc2 and self.csv_loader_thread_tc2.isRunning():
+            return
+        
+        # Show progress dialog
+        self.progress_dialog = QProgressDialog("Loading CSV files (TC2 with filtering)...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.show()
+        
+        # Start background loading with filtering
+        self.csv_loader_thread_tc2 = CSVLoaderThreadTC2(csv_paths, self.layout_freeshapes)
+        self.csv_loader_thread_tc2.progress.connect(self.progress_dialog.setValue)
+        self.csv_loader_thread_tc2.file_loaded.connect(self.on_csv_file_loaded)
+        self.csv_loader_thread_tc2.finished_loading.connect(self.on_all_csv_loaded)
+        self.csv_loader_thread_tc2.start()
         
     def on_csv_file_loaded(self, filename, points, events, correct_points = False):
         """Handle individual CSV file loaded"""
@@ -676,10 +802,15 @@ class MainWindow(QMainWindow):
         load_layoutReflectors_action.triggered.connect(self.load_layoutReflectors_file)
         file_menu.addAction(load_layoutReflectors_action)
 
-        # Load CSV action
-        load_csv_action = QAction("Load Logs", self)
-        load_csv_action.triggered.connect(self.load_csv_files)
-        file_menu.addAction(load_csv_action)
+        # Load CSV TC3 action
+        load_csv_tc3_action = QAction("Load Logs TC3", self)
+        load_csv_tc3_action.triggered.connect(self.load_csv_files_tc3)
+        file_menu.addAction(load_csv_tc3_action)
+        
+        # Load CSV TC2 action
+        load_csv_tc2_action = QAction("Load Logs TC2", self)
+        load_csv_tc2_action.triggered.connect(self.load_csv_files_tc2)
+        file_menu.addAction(load_csv_tc2_action)
 
         file_menu.addSeparator()
         
@@ -773,11 +904,24 @@ class MainWindow(QMainWindow):
         if file_path:
             self.viewer.load_dxf(file_path)
 
-    def load_csv_files(self):
-        """Load multiple CSV files using optimized async loader"""
+    def load_csv_files_tc3(self):
+        """Load multiple CSV files using optimized async loader (TC3 - no filtering)"""
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Open CSV Files", "", "CSV Files (*.csv)")
         if file_paths:
             self.viewer.load_csv_files_async(file_paths)
+    
+    def load_csv_files_tc2(self):
+        """Load multiple CSV files with TC2 layer-based filtering"""
+        # Check if db3 has been loaded
+        if not self.viewer.db3_loaded:
+            error_msg = "[ERROR] Load layout db3 first before loading TC2 logs."
+            print(error_msg)
+            self.log_to_console(error_msg)
+            return
+        
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Open CSV Files (TC2)", "", "CSV Files (*.csv)")
+        if file_paths:
+            self.viewer.load_csv_files_async_tc2(file_paths)
 
     def load_layoutReflectors_file(self):
         """Load reflectors and FreeShapes from db3"""
