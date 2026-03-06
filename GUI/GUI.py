@@ -397,6 +397,7 @@ class DXFViewer(QGraphicsView):
         progress.setValue(0)
         QApplication.processEvents()
 
+        conn = None
         try:
             conn = sqlite3.connect(db3_path)
             cursor = conn.cursor()
@@ -418,15 +419,17 @@ class DXFViewer(QGraphicsView):
             progress.setLabelText("Loading background geometry...")
             progress.setValue(3)
             QApplication.processEvents()
-            self.load_background_from_db(conn)
+            self.load_background_from_db(cursor)
 
-            conn.close()
         except Exception as e:
-            progress.close()
             msg = f"[ERROR] Failed to load layout: {e}"
             print(msg)
             self.status_updated.emit(msg)
+            progress.close()
             return
+        finally:
+            if conn:
+                conn.close()
 
         self.db3_loaded = True
         self.visualize_layout_reflectors([(row[1], row[2]) for row in reflector_rows])
@@ -486,7 +489,7 @@ class DXFViewer(QGraphicsView):
         print(msg)
         self.status_updated.emit(msg)
 
-    def load_background_from_db(self, conn):
+    def load_background_from_db(self, cursor):
         """Load and draw background geometry from BackGround and DxfPolylinePoints tables"""
         pen = QPen(QColor(170, 170, 170))
         pen.setWidth(0)
@@ -494,14 +497,13 @@ class DXFViewer(QGraphicsView):
         counts = {1: 0, 2: 0, 3: 0, 4: 0}
 
         try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT Type, Data1, Data2, Data3, Data4, Data5 FROM BackGround")
-            rows = cursor.fetchall()
+            # Use a cursor iterator instead of fetchall() to reduce memory usage for large tables
+            background_entities = cursor.execute("SELECT Type, Data1, Data2, Data3, Data4, Data5 FROM BackGround")
         except Exception as e:
-            print(f"[ERROR] Failed to query BackGround table: {e}")
+            self.status_updated.emit(f"[ERROR] Failed to query BackGround table: {e}")
             return
 
-        for row in rows:
+        for i, row in enumerate(background_entities):
             entity_type, d1, d2, d3, d4, d5 = row
             try:
                 if entity_type == 1:
@@ -519,40 +521,63 @@ class DXFViewer(QGraphicsView):
                     counts[2] += 1
                 elif entity_type == 3:
                     # Polyline: first PointId = d2, num points = d3
-                    self._draw_bg_polyline(conn, int(d2), int(d3), pen)
+                    self._draw_bg_polyline(cursor, int(d2), int(d3), pen)
                     counts[3] += 1
                 elif entity_type == 4:
                     # Insert: skip
                     counts[4] += 1
-            except Exception as e:
-                print(f"[ERROR] BackGround entity type {entity_type}: {e}")
+            except (ValueError, TypeError) as e:
+                self.status_updated.emit(f"[ERROR] BackGround entity type {entity_type} has invalid data: {e}")
 
-        print(
+            # Periodically process events to keep the GUI responsive during long loads
+            if i > 0 and i % 1000 == 0:
+                QApplication.processEvents()
+
+        bg_info_msg = (
             f"[INFO] Background geometry: Lines={counts[1]}, Circles={counts[2]}, "
             f"Polylines={counts[3]}, Inserts(skipped)={counts[4]}"
         )
+        print(bg_info_msg)
+        self.status_updated.emit(bg_info_msg)
 
-    def _draw_bg_polyline(self, conn, first_point_id, num_points, pen):
+    def _draw_bg_polyline(self, cursor, first_point_id, num_points, pen):
         """Query DxfPolylinePoints and draw consecutive line segments"""
+        # Create a new, separate cursor for this sub-query to avoid
+        # disrupting the iteration over the BackGround table in the calling function.
+        poly_cursor = cursor.connection.cursor()
         try:
-            cursor = conn.cursor()
-            cursor.execute(
+            poly_cursor.execute(
                 "SELECT X, Y FROM DxfPolylinePoints "
                 "WHERE PointId >= ? AND PointId < ? ORDER BY PointId",
                 (first_point_id, first_point_id + num_points),
             )
-            points = cursor.fetchall()
+            points = poly_cursor.fetchall()
         except Exception as e:
-            print(f"[ERROR] DxfPolylinePoints query failed: {e}")
+            self.status_updated.emit(f"[ERROR] DxfPolylinePoints query failed for polyline starting at {first_point_id}: {e}")
+            return
+
+        # If the query is successful but returns no points, it's a data integrity issue.
+        # This is a common cause for layouts loading with very few background entities.
+        if not points:
+            self.status_updated.emit(f"[WARNING] Polyline (ID {first_point_id}) has no points in DxfPolylinePoints table.")
+            return
+
+        # A polyline needs at least 2 points to draw a line.
+        if len(points) < 2:
+            self.status_updated.emit(f"[WARNING] Polyline (ID {first_point_id}) has only {len(points)} point(s) and cannot be drawn.")
             return
 
         for i in range(len(points) - 1):
-            x1, y1 = float(points[i][0]),     float(points[i][1])
-            x2, y2 = float(points[i + 1][0]), float(points[i + 1][1])
-            item = self.scene.addLine(x1, y1, x2, y2, pen)
-            item.setZValue(0)
-            self.background_items.append(item)
-        
+            try:
+                x1, y1 = float(points[i][0]),     float(points[i][1])
+                x2, y2 = float(points[i + 1][0]), float(points[i + 1][1])
+                item = self.scene.addLine(x1, y1, x2, y2, pen)
+                item.setZValue(0)
+                self.background_items.append(item)
+            except (ValueError, TypeError) as e:
+                self.status_updated.emit(f"[ERROR] Polyline point data error for polyline starting at {first_point_id}: {e}")
+                continue
+
     def visualize_reflectors(self, reflector_scores):
         """Create yellow circles for found reflectors with hover tooltips"""
         # Clear existing reflector visualizations
