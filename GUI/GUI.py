@@ -198,6 +198,82 @@ class CSVLoaderThreadTC2(QThread):
         return points, events
 
 
+class BackgroundLoaderThread(QThread):
+    """
+    Reads ALL geometry from BackGround + DxfPolylinePoints in a background thread.
+    Key optimisation: loads the entire DxfPolylinePoints table into a dict once,
+    eliminating the N individual sub-queries that caused slow loads on dense layouts.
+    Emits raw coordinate data; QGraphicsItems are created on the main thread.
+    """
+    progress = pyqtSignal(int, int)          # (processed, total)
+    finished = pyqtSignal(list, list, dict)  # (line_segs, ellipses, counts)
+    log      = pyqtSignal(str)
+
+    def __init__(self, db_path):
+        super().__init__()
+        self.db_path = db_path
+
+    def run(self):
+        try:
+            conn   = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # 1. How many entities to process (drives progress bar)
+            total = cursor.execute("SELECT COUNT(*) FROM BackGround").fetchone()[0]
+            self.progress.emit(0, total)
+
+            # 2. Preload ALL polyline points in one shot  (dict: PointId → (x, y))
+            poly_points = {}
+            for pid, x, y in cursor.execute(
+                "SELECT PointId, X, Y FROM DxfPolylinePoints ORDER BY PointId"
+            ):
+                poly_points[int(pid)] = (float(x), float(y))
+
+            # 3. Iterate BackGround and build flat lists of primitives
+            line_segs = []  # (x1, y1, x2, y2)
+            ellipses  = []  # (x, y, w, h) in bounding-box form
+            counts    = {1: 0, 2: 0, 3: 0, 4: 0}
+
+            for i, row in enumerate(cursor.execute(
+                "SELECT Type, Data1, Data2, Data3, Data4, Data5 FROM BackGround"
+            )):
+                entity_type, d1, d2, d3, d4, _d5 = row
+                try:
+                    if entity_type == 1:
+                        line_segs.append((float(d1), float(d2), float(d3), float(d4)))
+                        counts[1] += 1
+                    elif entity_type == 2:
+                        cx, cy, r = float(d1), float(d2), float(d3)
+                        ellipses.append((cx - r, cy - r, 2.0 * r, 2.0 * r))
+                        counts[2] += 1
+                    elif entity_type == 3:
+                        first_id = int(d2)
+                        num_pts  = int(d3)
+                        pts = [poly_points[pid]
+                               for pid in range(first_id, first_id + num_pts)
+                               if pid in poly_points]
+                        for j in range(len(pts) - 1):
+                            line_segs.append((pts[j][0], pts[j][1],
+                                              pts[j + 1][0], pts[j + 1][1]))
+                        if len(pts) >= 2:
+                            counts[3] += 1
+                    elif entity_type == 4:
+                        counts[4] += 1
+                except (ValueError, TypeError) as e:
+                    self.log.emit(f"[WARNING] BackGround row {i} (type {entity_type}): {e}")
+
+                if i % 500 == 0:
+                    self.progress.emit(i, total)
+
+            self.progress.emit(total, total)
+            conn.close()
+            self.finished.emit(line_segs, ellipses, counts)
+
+        except Exception as e:
+            self.log.emit(f"[ERROR] BackgroundLoaderThread: {e}")
+            self.finished.emit([], [], {})
+
+
 class DXFViewer(QGraphicsView):
     status_updated = pyqtSignal(str)  # Emitted to push messages to the console
 
@@ -222,6 +298,9 @@ class DXFViewer(QGraphicsView):
         self.csv_loader_thread = None
         self.csv_loader_thread_tc2 = None
         self.progress_dialog = None
+
+        # Background geometry loader thread
+        self._bg_loader = None
         
         # Database layout data
         self.layout_reflectors = []  # Store reflectors from db3
@@ -383,60 +462,109 @@ class DXFViewer(QGraphicsView):
         self.status_updated.emit(msg)
 
     def load_layout(self, db3_path):
-        """Load reflectors, FreeShapes and background geometry from db3"""
-        # Auto-clear any previously loaded layout before loading a new one
+        """Load reflectors and FreeShapes synchronously (fast), then kick off
+        BackgroundLoaderThread for the heavy geometry work."""
         if self.db3_loaded:
             self.clear_layout()
 
         label = os.path.basename(db3_path)
 
-        # Progress dialog – 4 steps: Reflectors, FreeShapes, Background, Fit
-        progress = QProgressDialog(f"Loading layout: {label}", None, 0, 4, self.window())
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        QApplication.processEvents()
-
-        conn = None
+        # --- Fast sync part: Reflectors + FreeShapes ---
         try:
             conn = sqlite3.connect(db3_path)
             cursor = conn.cursor()
-
-            progress.setLabelText("Loading reflectors...")
-            progress.setValue(1)
-            QApplication.processEvents()
             cursor.execute("SELECT ID, X, Y FROM Reflectors")
             reflector_rows = cursor.fetchall()
-            self.layout_reflectors = reflector_rows
-
-            progress.setLabelText("Loading layers (FreeShapes)...")
-            progress.setValue(2)
-            QApplication.processEvents()
             cursor.execute("SELECT ID, X1, X2, Y1, Y2 FROM FreeShapes")
             freeshape_rows = cursor.fetchall()
-            self.layout_freeshapes = freeshape_rows
-
-            progress.setLabelText("Loading background geometry...")
-            progress.setValue(3)
-            QApplication.processEvents()
-            self.load_background_from_db(cursor)
-
+            conn.close()
         except Exception as e:
-            msg = f"[ERROR] Failed to load layout: {e}"
+            msg = f"[ERROR] Failed to load layout metadata: {e}"
             print(msg)
             self.status_updated.emit(msg)
-            progress.close()
             return
-        finally:
-            if conn:
-                conn.close()
 
-        self.db3_loaded = True
+        self.layout_reflectors = reflector_rows
+        self.layout_freeshapes = freeshape_rows
         self.visualize_layout_reflectors([(row[1], row[2]) for row in reflector_rows])
 
-        progress.setLabelText("Fitting view...")
-        progress.setValue(4)
+        msg = (f"[INFO] Metadata loaded: {len(reflector_rows)} reflectors, "
+               f"{len(freeshape_rows)} layers. Loading background geometry...")
+        print(msg)
+        self.status_updated.emit(msg)
+
+        # --- Async part: background geometry (can be slow for large layouts) ---
+        self.progress_dialog = QProgressDialog(
+            f"Reading background geometry: {label}", None, 0, 0, self.window()
+        )
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.show()
         QApplication.processEvents()
+
+        self._bg_loader = BackgroundLoaderThread(db3_path)
+        self._bg_loader.progress.connect(self._on_bg_read_progress)
+        self._bg_loader.log.connect(lambda m: (print(m), self.status_updated.emit(m)))
+        self._bg_loader.finished.connect(
+            lambda segs, elps, cnts: self._on_background_loaded(
+                segs, elps, cnts, reflector_rows, freeshape_rows
+            )
+        )
+        self._bg_loader.start()
+
+    def _on_bg_read_progress(self, current, total):
+        """Update progress dialog while the background thread reads the database."""
+        if not self.progress_dialog:
+            return
+        if total > 0:
+            if self.progress_dialog.maximum() == 0:
+                self.progress_dialog.setMaximum(total)
+            self.progress_dialog.setValue(current)
+            self.progress_dialog.setLabelText(
+                f"Reading background geometry... {current:,} / {total:,} entities"
+            )
+
+    def _on_background_loaded(self, line_segs, ellipses, counts, reflector_rows, freeshape_rows):
+        """Create QGraphicsItems on the main thread from raw data received from the loader thread."""
+        pen = QPen(QColor(170, 170, 170))
+        pen.setWidth(0)
+
+        total_items = len(line_segs) + len(ellipses)
+
+        if self.progress_dialog:
+            self.progress_dialog.setMaximum(total_items if total_items > 0 else 1)
+            self.progress_dialog.setValue(0)
+            self.progress_dialog.setLabelText(f"Drawing {total_items:,} entities...")
+            QApplication.processEvents()
+
+        # Draw lines (includes polyline segments – already flattened by the thread)
+        for i, (x1, y1, x2, y2) in enumerate(line_segs):
+            item = self.scene.addLine(x1, y1, x2, y2, pen)
+            item.setZValue(0)
+            self.background_items.append(item)
+            if i % 2000 == 0 and self.progress_dialog:
+                self.progress_dialog.setValue(i)
+                QApplication.processEvents()
+
+        # Draw circles
+        for j, (x, y, w, h) in enumerate(ellipses):
+            item = self.scene.addEllipse(x, y, w, h, pen)
+            item.setZValue(0)
+            self.background_items.append(item)
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        self.db3_loaded = True
+
+        count_msg = (
+            f"[INFO] Background geometry: Lines={counts.get(1, 0)}, "
+            f"Circles={counts.get(2, 0)}, Polylines={counts.get(3, 0)}, "
+            f"Inserts(skipped)={counts.get(4, 0)}"
+        )
+        print(count_msg)
+        self.status_updated.emit(count_msg)
 
         bbox = self.scene.itemsBoundingRect()
         if not bbox.isEmpty():
@@ -447,8 +575,6 @@ class DXFViewer(QGraphicsView):
             self.setTransform(self.transform().scale(1, -1))
             self.centerOn(bbox.center())
 
-        progress.close()
-
         msg = (
             f"[INFO] Layout loaded: {len(reflector_rows)} reflectors, "
             f"{len(freeshape_rows)} layers, "
@@ -456,7 +582,7 @@ class DXFViewer(QGraphicsView):
         )
         print(msg)
         self.status_updated.emit(msg)
-    
+
     def clear_layout_reflectors(self):
         """Clear only the blue db3 reflector dots, keeping background geometry"""
         count = len(self.layoutReflector_items)
@@ -488,95 +614,6 @@ class DXFViewer(QGraphicsView):
         msg = f"[INFO] Layout cleared ({n_reflectors} reflector markers, {n_bg} background entities removed)."
         print(msg)
         self.status_updated.emit(msg)
-
-    def load_background_from_db(self, cursor):
-        """Load and draw background geometry from BackGround and DxfPolylinePoints tables"""
-        pen = QPen(QColor(170, 170, 170))
-        pen.setWidth(0)
-
-        counts = {1: 0, 2: 0, 3: 0, 4: 0}
-
-        try:
-            # Use a cursor iterator instead of fetchall() to reduce memory usage for large tables
-            background_entities = cursor.execute("SELECT Type, Data1, Data2, Data3, Data4, Data5 FROM BackGround")
-        except Exception as e:
-            self.status_updated.emit(f"[ERROR] Failed to query BackGround table: {e}")
-            return
-
-        for i, row in enumerate(background_entities):
-            entity_type, d1, d2, d3, d4, d5 = row
-            try:
-                if entity_type == 1:
-                    # Line: (X1, Y1) -> (X2, Y2)
-                    item = self.scene.addLine(float(d1), float(d2), float(d3), float(d4), pen)
-                    item.setZValue(0)
-                    self.background_items.append(item)
-                    counts[1] += 1
-                elif entity_type == 2:
-                    # Circle: center (d1, d2), radius d3
-                    cx, cy, r = float(d1), float(d2), float(d3)
-                    item = self.scene.addEllipse(cx - r, cy - r, 2 * r, 2 * r, pen)
-                    item.setZValue(0)
-                    self.background_items.append(item)
-                    counts[2] += 1
-                elif entity_type == 3:
-                    # Polyline: first PointId = d2, num points = d3
-                    self._draw_bg_polyline(cursor, int(d2), int(d3), pen)
-                    counts[3] += 1
-                elif entity_type == 4:
-                    # Insert: skip
-                    counts[4] += 1
-            except (ValueError, TypeError) as e:
-                self.status_updated.emit(f"[ERROR] BackGround entity type {entity_type} has invalid data: {e}")
-
-            # Periodically process events to keep the GUI responsive during long loads
-            if i > 0 and i % 1000 == 0:
-                QApplication.processEvents()
-
-        bg_info_msg = (
-            f"[INFO] Background geometry: Lines={counts[1]}, Circles={counts[2]}, "
-            f"Polylines={counts[3]}, Inserts(skipped)={counts[4]}"
-        )
-        print(bg_info_msg)
-        self.status_updated.emit(bg_info_msg)
-
-    def _draw_bg_polyline(self, cursor, first_point_id, num_points, pen):
-        """Query DxfPolylinePoints and draw consecutive line segments"""
-        # Create a new, separate cursor for this sub-query to avoid
-        # disrupting the iteration over the BackGround table in the calling function.
-        poly_cursor = cursor.connection.cursor()
-        try:
-            poly_cursor.execute(
-                "SELECT X, Y FROM DxfPolylinePoints "
-                "WHERE PointId >= ? AND PointId < ? ORDER BY PointId",
-                (first_point_id, first_point_id + num_points),
-            )
-            points = poly_cursor.fetchall()
-        except Exception as e:
-            self.status_updated.emit(f"[ERROR] DxfPolylinePoints query failed for polyline starting at {first_point_id}: {e}")
-            return
-
-        # If the query is successful but returns no points, it's a data integrity issue.
-        # This is a common cause for layouts loading with very few background entities.
-        if not points:
-            self.status_updated.emit(f"[WARNING] Polyline (ID {first_point_id}) has no points in DxfPolylinePoints table.")
-            return
-
-        # A polyline needs at least 2 points to draw a line.
-        if len(points) < 2:
-            self.status_updated.emit(f"[WARNING] Polyline (ID {first_point_id}) has only {len(points)} point(s) and cannot be drawn.")
-            return
-
-        for i in range(len(points) - 1):
-            try:
-                x1, y1 = float(points[i][0]),     float(points[i][1])
-                x2, y2 = float(points[i + 1][0]), float(points[i + 1][1])
-                item = self.scene.addLine(x1, y1, x2, y2, pen)
-                item.setZValue(0)
-                self.background_items.append(item)
-            except (ValueError, TypeError) as e:
-                self.status_updated.emit(f"[ERROR] Polyline point data error for polyline starting at {first_point_id}: {e}")
-                continue
 
     def visualize_reflectors(self, reflector_scores):
         """Create yellow circles for found reflectors with hover tooltips"""
