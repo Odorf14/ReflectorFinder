@@ -21,12 +21,12 @@ def correctPointPos(events, reflector_radius = 32):
     
     return np.array(corrected_points)
 
-def findClusters(points):
+def findClusters(points, eps=3.5, min_samples=30):
     """Use DBSCAN to cluster points and identify reflectors"""
     if len(points) == 0:
         return np.array([])
     
-    dbscan = DBSCAN(eps=3.5, min_samples=30)
+    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
     cluster_flags = dbscan.fit_predict(points)
 
     return cluster_flags
@@ -121,7 +121,7 @@ def calcConfidence(cluster_events, max_freq=50, max_lgv=10, max_time_span=7200, 
     return confidence
 
 
-def analyzeReflectors(points_array, all_events, confidence_threshold=0.3, offset_correction=False):
+def analyzeReflectors(points_array, all_events, confidence_threshold=0.3, offset_correction=False, eps=3.5, min_samples=30):
     """
     Main workflow function to analyze reflectors from point data
     
@@ -144,7 +144,7 @@ def analyzeReflectors(points_array, all_events, confidence_threshold=0.3, offset
         points_array = correctPointPos(all_events, reflector_radius=32)
 
     # Find clusters
-    cluster_flags = findClusters(points_array)
+    cluster_flags = findClusters(points_array, eps, min_samples)
     
     if len(cluster_flags) == 0:
         print("[WARNING] No clusters found")

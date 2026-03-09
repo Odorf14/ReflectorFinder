@@ -633,7 +633,7 @@ class DXFViewer(QGraphicsView):
         white_color = QColor(255, 255, 255, 255)  # Opaque white
         white_pen = QPen(QColor(255, 255, 255, 255), 2)  # White border
         
-        for cluster_id, centroid, confidence in reflector_scores:
+        for i, (cluster_id, centroid, confidence) in enumerate(reflector_scores, 1):
             x, y = centroid[0], centroid[1]
             # Create main yellow circle
             circle = QGraphicsEllipseItem(
@@ -654,7 +654,7 @@ class DXFViewer(QGraphicsView):
             center_dot.setZValue(11)  # Above the yellow circle
             
             # Set tooltip for both items
-            tooltip_text = (f"Reflector {cluster_id}\n"
+            tooltip_text = (f"Reflector {i}\n"
                           f"Confidence: {confidence:.3f}\n"
                           f"X: {x:.1f}\n"
                           f"Y: {y:.1f}")
@@ -1070,8 +1070,11 @@ class MainWindow(QMainWindow):
         reflector_scores = analyzeReflectors(
             self.viewer.all_points, 
             self.viewer.all_events,
-            confidence_threshold=min_confidence,
-            offset_correction=False
+            confidence_threshold=min_confidence if confidence_check else 0.0,
+            offset_correction=False,
+            eps =  globals()['eps'],
+            min_samples = globals()['min_samples'],
+
         )
         
         # Display console output
