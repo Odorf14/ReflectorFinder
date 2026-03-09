@@ -874,7 +874,7 @@ class MainWindow(QMainWindow):
         # Create console output area
         self.console = QTextEdit()
         self.console.setReadOnly(True)
-        self.console.setMaximumHeight(200)  # Limit height
+        self.console.setMaximumHeight(500)  # Limit height
         self.console.setStyleSheet("""
             QTextEdit {
                 background-color: #323232;
@@ -952,11 +952,13 @@ class MainWindow(QMainWindow):
         
         # Find TC2 Reflectors
         find_tc2_reflectors_action = QAction("Find TC2 Reflectors", self)
+        find_tc2_reflectors_action.triggered.connect(self.reload_configuration)
         find_tc2_reflectors_action.triggered.connect(self.find_tc2_reflectors)
         analysis_menu.addAction(find_tc2_reflectors_action)
         
         # Find TC3 Reflectors
         find_tc3_reflectors_action = QAction("Find TC3 Reflectors", self)
+        find_tc3_reflectors_action.triggered.connect(self.reload_configuration)
         find_tc3_reflectors_action.triggered.connect(self.find_reflectors_placeholder)
         analysis_menu.addAction(find_tc3_reflectors_action)
         
