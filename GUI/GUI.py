@@ -1,17 +1,25 @@
 import sys
 import csv
+import os
+import time
+import ctypes
+import math
+from datetime import datetime
+import pyads
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QAction,
     QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsEllipseItem,
-    QWidget, QVBoxLayout, QProgressDialog, QTextEdit, QSplitter
+    QGraphicsPolygonItem, QGraphicsSimpleTextItem,
+    QWidget, QVBoxLayout, QProgressDialog, QTextEdit, QSplitter,
+    QDialog, QFormLayout, QLabel, QLineEdit, QSpinBox, QCheckBox,
+    QPushButton, QHBoxLayout, QScrollArea, QGroupBox, QDialogButtonBox
 )
-from PyQt5.QtGui import QPen, QPainter, QColor
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QPen, QPainter, QColor, QPolygonF, QFont, QTransform
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF
 import numpy as np
 from ReflectorFinder import (analyzeReflectors, correctPointPos)
 import sqlite3
 import xml.etree.ElementTree as ET
-import os
 
 
 class CSVLoaderThread(QThread):
@@ -274,6 +282,311 @@ class BackgroundLoaderThread(QThread):
             self.finished.emit([], [], {})
 
 
+######################################################
+# TC3 Structs (shared between EKFReaderThread and any future TC3 consumers)
+######################################################
+
+class _ReflectorObs(ctypes.Structure):
+    _fields_ = [
+        ("timestamp", ctypes.c_uint64),
+        ("rho",       ctypes.c_float),
+        ("phi",       ctypes.c_float),
+        ("x",         ctypes.c_float),
+        ("y",         ctypes.c_float),
+        ("radius",    ctypes.c_float),
+        ("quality",   ctypes.c_float),
+    ]
+
+class _ReflectorLandmark(ctypes.Structure):
+    _fields_ = [
+        ("id",     ctypes.c_int32),
+        ("x",      ctypes.c_float),
+        ("y",      ctypes.c_float),
+        ("radius", ctypes.c_float),
+        ("hMin",   ctypes.c_float),
+        ("hMax",   ctypes.c_float),
+    ]
+
+class _ReflectorInfo(ctypes.Structure):
+    _fields_ = [
+        ("obs",          _ReflectorObs),
+        ("landmark",     _ReflectorLandmark),
+        ("wrtAgvX",      ctypes.c_float),
+        ("wrtAgvY",      ctypes.c_float),
+        ("worldX_preUpd",ctypes.c_float),
+        ("worldY_preUpd",ctypes.c_float),
+        ("worldX",       ctypes.c_float),
+        ("worldY",       ctypes.c_float),
+        ("updateLag",    ctypes.c_float),
+        ("associated",   ctypes.c_uint8),
+        ("pad",          ctypes.c_byte * 3),
+    ]
+
+_NUM_TC3_REFLECTORS = 50
+_ReflectorArray = _ReflectorInfo * _NUM_TC3_REFLECTORS
+_REFLECTOR_RAW_SIZE = ctypes.sizeof(_ReflectorArray)
+
+
+######################################################
+# EKF Settings Dialog
+######################################################
+
+class EKFSettingsDialog(QDialog):
+    def __init__(self, ekf_config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("EKF Viewer — Connection Settings")
+        self.setMinimumWidth(540)
+        self._original_config = {
+            "ams_net_id": ekf_config.get("ams_net_id", ""),
+            "port": ekf_config.get("port", 851),
+            "read_interval_ms": ekf_config.get("read_interval_ms", 1000),
+            "symbols": dict(ekf_config.get("symbols", {})),
+        }
+
+        outer = QVBoxLayout(self)
+
+        # --- Connection group ---
+        conn_group = QGroupBox("Connection")
+        conn_layout = QFormLayout(conn_group)
+
+        self.ams_edit = QLineEdit(ekf_config.get("ams_net_id", "192.168.11.2.1.1"))
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(ekf_config.get("port", 851))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(100, 60000)
+        self.interval_spin.setSuffix(" ms")
+        self.interval_spin.setValue(ekf_config.get("read_interval_ms", 1000))
+
+        conn_layout.addRow("AMS Net ID:", self.ams_edit)
+        conn_layout.addRow("Port:", self.port_spin)
+        conn_layout.addRow("Read Interval:", self.interval_spin)
+        outer.addWidget(conn_group)
+
+        # --- Symbols group (scrollable) ---
+        syms_group = QGroupBox("TC3 Symbols")
+        syms_layout = QFormLayout(syms_group)
+
+        symbols = ekf_config.get("symbols", {})
+        self._symbol_edits = {}
+        self._bypass_checks = {}
+
+        _bypass_sym_names = {"AvoidReflectorCheck", "Quality", "Aut_Run", "Man_Run", "IsNotMoving"}
+        _all_sym_order = [
+            "AvoidReflectorCheck", "Quality", "Aut_Run", "Man_Run", "IsNotMoving",
+            "LgvPosX", "LgvPosY", "LgvPosH", "NumLGV", "ForwMotion", "Reflectors",
+        ]
+        for sym_name in _all_sym_order:
+            sym_path, bypass = symbols.get(sym_name, ("", False))
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            edit = QLineEdit(sym_path)
+            row_layout.addWidget(edit)
+            self._symbol_edits[sym_name] = edit
+
+            if sym_name in _bypass_sym_names:
+                chk = QCheckBox("Bypass")
+                chk.setChecked(bypass)
+                row_layout.addWidget(chk)
+                self._bypass_checks[sym_name] = chk
+
+            syms_layout.addRow(f"{sym_name}:", row_widget)
+
+        scroll = QScrollArea()
+        scroll.setWidget(syms_group)
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(320)
+        outer.addWidget(scroll)
+
+        # --- Buttons ---
+        btn_box = QDialogButtonBox()
+        btn_box.addButton("Start", QDialogButtonBox.AcceptRole)
+        btn_box.addButton(QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        outer.addWidget(btn_box)
+
+    def get_config(self):
+        symbols = {}
+        for sym_name, edit in self._symbol_edits.items():
+            bypass_chk = self._bypass_checks.get(sym_name)
+            bypass = bypass_chk.isChecked() if bypass_chk else False
+            symbols[sym_name] = (edit.text().strip(), bypass)
+        return {
+            "ams_net_id": self.ams_edit.text().strip(),
+            "port": self.port_spin.value(),
+            "read_interval_ms": self.interval_spin.value(),
+            "symbols": symbols,
+        }
+
+    def config_changed(self):
+        return self.get_config() != self._original_config
+
+
+######################################################
+# EKF Reader Thread
+######################################################
+
+class EKFReaderThread(QThread):
+    cycle_data = pyqtSignal(float, float, float, list, list, bool, bool, float)
+    # lgv_x_mm, lgv_y_mm, lgv_h_cdeg, associated_list, new_unassoc_list, conditions_met, forw_motion, quality
+    lgv_number = pyqtSignal(int)
+    connection_status = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, ekf_config):
+        super().__init__()
+        self._config = ekf_config
+        self._stop_flag = False
+
+    def stop(self):
+        self._stop_flag = True
+
+    def run(self):
+        cfg = self._config
+        ams_net_id = cfg["ams_net_id"]
+        plc_ip = '.'.join(ams_net_id.split('.')[:4])
+        port = cfg["port"]
+        interval_ms = cfg["read_interval_ms"]
+        symbols = cfg["symbols"]
+
+        avoid_bypass      = symbols["AvoidReflectorCheck"][1]
+        quality_bypass    = symbols["Quality"][1]
+        aut_run_bypass    = symbols["Aut_Run"][1]
+        man_run_bypass    = symbols["Man_Run"][1]
+        isnotmoving_bypass = symbols["IsNotMoving"][1]
+        reflectors_sym    = symbols["Reflectors"][0]
+
+        plc = pyads.Connection(ams_net_id, port, plc_ip)
+        try:
+            plc.open()
+            self.connection_status.emit(f"[INFO] EKF Viewer: Connected to {ams_net_id}:{port}")
+        except pyads.ADSError as e:
+            self.connection_status.emit(f"[ERROR] EKF Viewer: Could not connect: {e}")
+            self.finished.emit()
+            return
+
+        def _fetch_handles():
+            h = {
+                "lgv_x":     plc.get_symbol(symbols["LgvPosX"][0]),
+                "lgv_y":     plc.get_symbol(symbols["LgvPosY"][0]),
+                "lgv_h":     plc.get_symbol(symbols["LgvPosH"][0]),
+                "avoid":     plc.get_symbol(symbols["AvoidReflectorCheck"][0]) if not avoid_bypass else None,
+                "quality":   plc.get_symbol(symbols["Quality"][0])             if not quality_bypass else None,
+                "aut_run":   plc.get_symbol(symbols["Aut_Run"][0])             if not aut_run_bypass else None,
+                "man_run":   plc.get_symbol(symbols["Man_Run"][0])             if not man_run_bypass else None,
+                "isnotmoving": plc.get_symbol(symbols["IsNotMoving"][0])       if not isnotmoving_bypass else None,
+                "forw":        plc.get_symbol(symbols["ForwMotion"][0])        if "ForwMotion" in symbols else None,
+            }
+            return h
+
+        try:
+            handles = _fetch_handles()
+        except pyads.ADSError as e:
+            self.connection_status.emit(f"[ERROR] EKF Viewer: Failed to get symbol handles: {e}")
+            try:
+                plc.close()
+            except Exception:
+                pass
+            self.finished.emit()
+            return
+
+        # Read LGV number once after connection (graceful if symbol absent or old config)
+        try:
+            if "NumLGV" in symbols:
+                lgv_num_val = int(plc.get_symbol(symbols["NumLGV"][0]).read())
+                self.lgv_number.emit(lgv_num_val)
+        except Exception:
+            pass
+
+        previous_unassoc = []
+        next_time = time.perf_counter()
+
+        try:
+            while not self._stop_flag:
+                try:
+                    lgv_x = handles["lgv_x"].read()
+                    lgv_y = handles["lgv_y"].read()
+                    lgv_h = handles["lgv_h"].read()
+                    raw_data = plc.read_by_name(reflectors_sym, ctypes.c_ubyte * _REFLECTOR_RAW_SIZE)
+
+                    avoid      = handles["avoid"].read()      if handles["avoid"]      else False
+                    quality    = handles["quality"].read()    if handles["quality"]    else 0.0
+                    aut_run    = handles["aut_run"].read()    if handles["aut_run"]    else False
+                    man_run    = handles["man_run"].read()    if handles["man_run"]    else False
+                    isnotmoving = handles["isnotmoving"].read() if handles["isnotmoving"] else False
+
+                    avoidref_ok  = avoid_bypass      or not avoid
+                    quality_ok   = quality_bypass    or quality > 0.8
+                    run_ok       = (aut_run_bypass and man_run_bypass) or aut_run or man_run
+                    notmoving_ok = isnotmoving_bypass or not isnotmoving
+                    conditions_met = avoidref_ok and quality_ok and run_ok and notmoving_ok
+
+                    reflectors = _ReflectorArray.from_buffer_copy(bytes(raw_data))
+
+                    associated = [
+                        (r.worldX, r.worldY, r.landmark.id)
+                        for r in reflectors
+                        if r.associated and r.worldX != 0.0
+                    ]
+                    unassoc_all = [
+                        (r.worldX, r.worldY)
+                        for r in reflectors
+                        if not r.associated and r.worldX != 0.0
+                    ]
+
+                    if conditions_met:
+                        new_unassoc = [pt for pt in unassoc_all if pt not in previous_unassoc]
+                    else:
+                        new_unassoc = []
+
+                    previous_unassoc = unassoc_all
+
+                    forw_motion = handles["forw"].read() if handles.get("forw") else True
+                    self.cycle_data.emit(lgv_x, lgv_y, lgv_h, associated, new_unassoc, conditions_met, forw_motion, quality)
+
+                except pyads.ADSError as e:
+                    self.connection_status.emit(f"[WARNING] EKF Viewer: Read error: {e}. Reconnecting...")
+                    try:
+                        plc.close()
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                    if self._stop_flag:
+                        break
+                    try:
+                        plc.open()
+                        handles = _fetch_handles()
+                        self.connection_status.emit("[INFO] EKF Viewer: Reconnected.")
+                    except pyads.ADSError as conn_err:
+                        self.connection_status.emit(f"[ERROR] EKF Viewer: Reconnect failed: {conn_err}")
+                    next_time = time.perf_counter()
+                    continue
+
+                except Exception as e:
+                    self.connection_status.emit(f"[WARNING] EKF Viewer: Unexpected error: {e}")
+                    time.sleep(1.0)
+                    next_time = time.perf_counter()
+                    continue
+
+                next_time += interval_ms / 1000.0
+                sleep_time = next_time - time.perf_counter()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_time = time.perf_counter()
+
+        finally:
+            try:
+                plc.close()
+            except Exception:
+                pass
+            self.connection_status.emit("[INFO] EKF Viewer: Disconnected.")
+            self.finished.emit()
+
+
 class DXFViewer(QGraphicsView):
     status_updated = pyqtSignal(str)  # Emitted to push messages to the console
 
@@ -314,6 +627,15 @@ class DXFViewer(QGraphicsView):
         self.reflector_radius = 32
         self.highlight_radius = 1750
         
+        # EKF Viewer state
+        self._ekf_follow = False
+        self.ekf_lgv_arrow = None
+        self.ekf_lgv_quality_text = None
+        self.ekf_associated_items = []
+        self.ekf_unassociated_items = []
+        self.ekf_unassociated_data = []   # list of (timestamp, x_mm, y_mm, lgv_x_mm, lgv_y_mm)
+        self._ekf_zoom_on_first = False    # zoom in to LGV on first arrow update
+
         # Initialize empty scene with dark background
         self.setBackgroundBrush(QColor(50, 50, 50))
 
@@ -572,7 +894,7 @@ class DXFViewer(QGraphicsView):
             self.scene.setSceneRect(bbox.adjusted(-margin, -margin, margin, margin))
             self.resetTransform()
             self.fitInView(bbox, Qt.KeepAspectRatio)
-            self.setTransform(self.transform().scale(1, -1))
+            self.ensure_y_flip()
             self.centerOn(bbox.center())
 
         msg = (
@@ -707,6 +1029,155 @@ class DXFViewer(QGraphicsView):
         print(msg)
         self.status_updated.emit(msg)
 
+    # ------------------------------------------------------------------
+    # EKF Viewer — view helpers
+    # ------------------------------------------------------------------
+
+    def ensure_y_flip(self):
+        """Apply Y-axis flip to the view exactly once (idempotent)."""
+        if self.transform().m22() > 0:
+            self.setTransform(self.transform().scale(1, -1))
+
+    def set_ekf_follow(self, enabled):
+        """Enable/disable auto-centering on the LGV arrow each cycle."""
+        self._ekf_follow = enabled
+
+    def update_lgv_arrow(self, x_mm, y_mm, h_cdeg, forw_motion=True, quality=0.0):
+        """Create (first call) or update the LGV position arrow.
+
+        x_mm, y_mm:  world position in millimetres (scene units).
+        h_cdeg:      heading in centidegrees; 0 = north (+Y), increases CW.
+        forw_motion: True = forward (cyan/blue), False = reverse (pink).
+        """
+        self.ensure_y_flip()
+        if self.ekf_lgv_arrow is None:
+            # Triangle pointing in the +scene-Y direction (north after Y-flip).
+            # Tip forward, two rear corners + small notch at rear centre.
+            arrow_poly = QPolygonF([
+                QPointF(   0.0,  900.0),   # tip (forward)
+                QPointF(-330.0, -390.0),   # rear-left
+                QPointF(   0.0,  -90.0),   # rear notch
+                QPointF( 330.0, -390.0),   # rear-right
+            ])
+            self.ekf_lgv_arrow = QGraphicsPolygonItem(arrow_poly)
+            self.ekf_lgv_arrow.setZValue(20)
+            self.scene.addItem(self.ekf_lgv_arrow)
+
+        # Update color every cycle based on forward/reverse direction
+        if forw_motion:
+            self.ekf_lgv_arrow.setBrush(QColor(0, 220, 255, 210))    # cyan-blue
+            self.ekf_lgv_arrow.setPen(QPen(QColor(0, 170, 210), 60))
+        else:
+            self.ekf_lgv_arrow.setBrush(QColor(255, 110, 200, 210))  # pink
+            self.ekf_lgv_arrow.setPen(QPen(QColor(220, 60, 170), 60))
+
+        self.ekf_lgv_arrow.setPos(x_mm, y_mm)
+        # h_cdeg is CW-from-north in centidegrees.  -90° aligns the polygon
+        # (which points in +Y = north) with the actual forward direction.
+        self.ekf_lgv_arrow.setRotation(h_cdeg * 0.01 - 90.0)
+
+        # Quality label — rendered as a separate upright text item inside the arrow
+        quality_pct = f"{quality * 100:.0f}%"
+        if self.ekf_lgv_quality_text is None:
+            self.ekf_lgv_quality_text = QGraphicsSimpleTextItem()
+            font = QFont("Arial")
+            font.setPointSizeF(180)
+            font.setBold(True)
+            self.ekf_lgv_quality_text.setFont(font)
+            self.ekf_lgv_quality_text.setBrush(QColor(255, 255, 255, 230))
+            self.ekf_lgv_quality_text.setZValue(21)
+            # Counter-act the view's Y-flip so text reads normally
+            self.ekf_lgv_quality_text.setTransform(QTransform.fromScale(1, -1))
+            self.scene.addItem(self.ekf_lgv_quality_text)
+        self.ekf_lgv_quality_text.setText(quality_pct)
+        br = self.ekf_lgv_quality_text.boundingRect()
+        # Centre horizontally; place inside the arrow body (~200 mm above the origin)
+        self.ekf_lgv_quality_text.setPos(x_mm - br.width() / 2, y_mm + 200)
+
+        if self._ekf_follow:
+            self.centerOn(x_mm, y_mm)
+
+        if self._ekf_zoom_on_first:
+            self._ekf_zoom_on_first = False
+            # Show a ~20 m × 20 m window centred on the LGV
+            zoom_half = 10000.0   # mm
+            from PyQt5.QtCore import QRectF
+            self.fitInView(
+                QRectF(x_mm - zoom_half, y_mm - zoom_half, zoom_half * 2, zoom_half * 2),
+                Qt.KeepAspectRatio
+            )
+            self.ensure_y_flip()
+            self.centerOn(x_mm, y_mm)
+
+    def update_associated_reflectors(self, reflectors_mm):
+        """Replace the green associated-reflector dots with the current set."""
+        for item in self.ekf_associated_items:
+            self.scene.removeItem(item)
+        self.ekf_associated_items.clear()
+
+        r = self.reflector_radius * 4
+        ring_width = max(r * 0.45, 8)
+        green_pen = QPen(QColor(0, 220, 80, 230), ring_width)
+        # Font scaled so text height ≈ r (1 pt ≈ 0.353 mm in scene units)
+        label_font = QFont("Arial", max(1, int(r * 0.75)))
+        # Y-flip correction: items in a Y-flipped scene appear upside-down;
+        # applying scale(1,-1) on the item counteracts the view flip.
+        flip_tf = QTransform.fromScale(1, -1)
+        for x, y, lid in reflectors_mm:
+            ellipse = QGraphicsEllipseItem(x - r, y - r, r * 2, r * 2)
+            ellipse.setBrush(Qt.transparent)
+            ellipse.setPen(green_pen)
+            ellipse.setZValue(5)
+            self.scene.addItem(ellipse)
+            self.ekf_associated_items.append(ellipse)
+
+            label = QGraphicsSimpleTextItem(str(lid))
+            label.setFont(label_font)
+            label.setBrush(QColor(255, 255, 100))   # yellow
+            label.setTransform(flip_tf)
+            # Place label baseline (visual top after flip) slightly above centre
+            label.setPos(x + r * 1.15, y + r * 0.5)
+            label.setZValue(6)
+            self.scene.addItem(label)
+            self.ekf_associated_items.append(label)
+
+    def add_unassociated_reflectors(self, reflectors_mm, lgv_x_mm, lgv_y_mm):
+        """Accumulate new non-associated reflector dots (EKF viewer — same size as green donuts)."""
+        r = self.reflector_radius * 4   # match green donut radius
+        red_color = QColor(255, 0, 0, 180)
+        dot_pen = QPen(red_color)
+        dot_pen.setWidth(0)
+        timestamp = datetime.now().isoformat(timespec='milliseconds')
+        for x, y in reflectors_mm:
+            ellipse = QGraphicsEllipseItem(
+                x - r, y - r, r * 2, r * 2
+            )
+            ellipse.setPen(dot_pen)
+            ellipse.setBrush(red_color)
+            ellipse.setZValue(1)
+            self.scene.addItem(ellipse)
+            self.ekf_unassociated_items.append(ellipse)
+            self.ekf_unassociated_data.append(
+                (timestamp, round(x), round(y), round(lgv_x_mm), round(lgv_y_mm))
+            )
+
+    def clear_ekf_items(self):
+        """Remove all EKF viewer visual elements and reset EKF state."""
+        if self.ekf_lgv_arrow is not None:
+            self.scene.removeItem(self.ekf_lgv_arrow)
+            self.ekf_lgv_arrow = None
+        if self.ekf_lgv_quality_text is not None:
+            self.scene.removeItem(self.ekf_lgv_quality_text)
+            self.ekf_lgv_quality_text = None
+        for item in self.ekf_associated_items:
+            self.scene.removeItem(item)
+        self.ekf_associated_items.clear()
+        for item in self.ekf_unassociated_items:
+            self.scene.removeItem(item)
+        self.ekf_unassociated_items.clear()
+        self.ekf_unassociated_data.clear()
+        self._ekf_follow = False
+        self._ekf_zoom_on_first = False
 
     def wheelEvent(self, event):
         """Handle mouse wheel zoom anchored to the mouse pointer (free zoom)"""
@@ -792,6 +1263,31 @@ def generate_configfile():
     ET.SubElement(found_reflector, "PointRadius").text = '32' #center_dot_radius
     ET.SubElement(found_reflector, "HighlightRadius").text = '1750' #circle_radius
 
+    ekf_viewer = ET.SubElement(root, "EKF_Viewer")
+    ekf_conn = ET.SubElement(ekf_viewer, "Connection")
+    ET.SubElement(ekf_conn, "AmsNetId").text = '192.168.11.2.1.1'
+    ET.SubElement(ekf_conn, "Port").text = '851'
+    ET.SubElement(ekf_conn, "ReadIntervalMs").text = '1000'
+
+    ekf_syms_root = ET.SubElement(ekf_viewer, "Symbols")
+    _ekf_sym_defs = [
+        ("AvoidReflectorCheck", "CustomPlcAttribute.AvoidReflectorCheck_sp", True),
+        ("Quality",             "Sys_ExternalLocalization.extPoseInfo.quality", True),
+        ("Aut_Run",             "LibraryInterfaces.LGV.Status.Aut_Run", True),
+        ("Man_Run",             "LibraryInterfaces.LGV.Status.Man_Run", True),
+        ("IsNotMoving",         "LibraryInterfaces.LGV.Status.IsNotMoving", True),
+        ("LgvPosX",             "LibraryInterfaces.LGV.Guid.Info.Pos.X", False),
+        ("LgvPosY",             "LibraryInterfaces.LGV.Guid.Info.Pos.Y", False),
+        ("LgvPosH",             "LibraryInterfaces.LGV.Guid.Info.Pos.H", False),
+        ("NumLGV",              "LibraryInterfaces.LGV.Info.NumLGV", False),
+        ("ForwMotion",          "LibraryInterfaces.LGV.Guid.Rout.Cur_Seg_Info.Forw", False),
+        ("Reflectors",          "Sys_ExternalLocalization.extReflectorSet[1].reflectors", False),
+    ]
+    for _sname, _spath, _has_bypass in _ekf_sym_defs:
+        _selem = ET.SubElement(ekf_syms_root, _sname)
+        ET.SubElement(_selem, "Symbol").text = _spath
+        if _has_bypass:
+            ET.SubElement(_selem, "Bypass").text = 'False'
 
     ET.indent(root, space="  ", level=0)
 
@@ -839,10 +1335,79 @@ def load_configuration():
     reflector_radius = int(root.find("GUI_Settings/Found_Reflector/PointRadius").text)
     highlight_radius = int(root.find("GUI_Settings/Found_Reflector/HighlightRadius").text)
 
+    # --- EKF Viewer config ---
+    ekf_section = root.find("EKF_Viewer")
+    if ekf_section is not None:
+        ekf_cfg = {
+            "ams_net_id": ekf_section.find("Connection/AmsNetId").text,
+            "port": int(ekf_section.find("Connection/Port").text),
+            "read_interval_ms": int(ekf_section.find("Connection/ReadIntervalMs").text),
+            "symbols": {},
+        }
+        for sym_elem in ekf_section.find("Symbols"):
+            sym_name = sym_elem.tag
+            sym_path = sym_elem.find("Symbol").text
+            bypass_elem = sym_elem.find("Bypass")
+            bypass = bypass_elem is not None and bypass_elem.text.lower() == 'true'
+            ekf_cfg["symbols"][sym_name] = (sym_path, bypass)
+    else:
+        ekf_cfg = {
+            "ams_net_id": "192.168.11.2.1.1",
+            "port": 851,
+            "read_interval_ms": 1000,
+            "symbols": {
+                "AvoidReflectorCheck": ("CustomPlcAttribute.AvoidReflectorCheck_sp", False),
+                "Quality":             ("Sys_ExternalLocalization.extPoseInfo.quality", False),
+                "Aut_Run":             ("LibraryInterfaces.LGV.Status.Aut_Run", False),
+                "Man_Run":             ("LibraryInterfaces.LGV.Status.Man_Run", False),
+                "IsNotMoving":         ("LibraryInterfaces.LGV.Status.IsNotMoving", False),
+                "LgvPosX":             ("LibraryInterfaces.LGV.Guid.Info.Pos.X", False),
+                "LgvPosY":             ("LibraryInterfaces.LGV.Guid.Info.Pos.Y", False),
+                "LgvPosH":             ("LibraryInterfaces.LGV.Guid.Info.Pos.H", False),
+                "NumLGV":              ("LibraryInterfaces.LGV.Info.NumLGV", False),
+                "ForwMotion":          ("LibraryInterfaces.LGV.Guid.Rout.Cur_Seg_Info.Forw", False),
+                "Reflectors":          ("Sys_ExternalLocalization.extReflectorSet[1].reflectors", False),
+            },
+        }
+
     return (config_created, eps, min_samples, confidence_check, min_confidence,
             freq_weight, max_freq_threshold, lgv_div_weight, max_lgv_threshold,
             timestamp_weight, max_time_variance, spatial_weight, max_spatial_stddev,
-            log_radius, db3_radius, reflector_radius, highlight_radius)
+            log_radius, db3_radius, reflector_radius, highlight_radius, ekf_cfg)
+
+
+_EKF_BYPASS_SYMBOL_NAMES = {"AvoidReflectorCheck", "Quality", "Aut_Run", "Man_Run", "IsNotMoving"}
+
+
+def save_ekf_config(ekf_config):
+    """Update only the EKF_Viewer section of the config XML without touching other settings."""
+    config_path = get_config_path()
+    if not os.path.exists(config_path):
+        return
+    tree = ET.parse(config_path)
+    root = tree.getroot()
+
+    existing = root.find("EKF_Viewer")
+    if existing is not None:
+        root.remove(existing)
+
+    ekv = ET.SubElement(root, "EKF_Viewer")
+    conn = ET.SubElement(ekv, "Connection")
+    ET.SubElement(conn, "AmsNetId").text = ekf_config["ams_net_id"]
+    ET.SubElement(conn, "Port").text = str(ekf_config["port"])
+    ET.SubElement(conn, "ReadIntervalMs").text = str(ekf_config["read_interval_ms"])
+
+    syms_elem = ET.SubElement(ekv, "Symbols")
+    for sym_name, (sym_path, bypass) in ekf_config["symbols"].items():
+        sym_e = ET.SubElement(syms_elem, sym_name)
+        ET.SubElement(sym_e, "Symbol").text = sym_path
+        if sym_name in _EKF_BYPASS_SYMBOL_NAMES:
+            ET.SubElement(sym_e, "Bypass").text = str(bypass)
+
+    ET.indent(root, space="  ", level=0)
+    tree.write(config_path, encoding='utf-8', xml_declaration=True)
+    print("[INFO] EKF Viewer config saved.")
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -893,6 +1458,10 @@ class MainWindow(QMainWindow):
 
         # Setup menu
         self.init_menu()
+
+        # EKF Viewer runtime state
+        self._ekf_thread = None
+        self._ekf_lgv_number = 0
         
         self.destroyed.connect(QApplication.quit)
 
@@ -967,6 +1536,25 @@ class MainWindow(QMainWindow):
         reload_config_action.triggered.connect(self.reload_configuration)
         analysis_menu.addAction(reload_config_action)
 
+        # EKF VIEWER MENU
+        ekf_menu = menubar.addMenu("EKF Viewer")
+
+        self._ekf_action_start = QAction("Start EKF Viewer", self)
+        self._ekf_action_start.triggered.connect(self.start_ekf_viewer)
+        ekf_menu.addAction(self._ekf_action_start)
+
+        self._ekf_action_stop = QAction("Stop EKF Viewer", self)
+        self._ekf_action_stop.triggered.connect(self.stop_ekf_viewer)
+        self._ekf_action_stop.setEnabled(False)
+        ekf_menu.addAction(self._ekf_action_stop)
+
+        ekf_menu.addSeparator()
+
+        self._ekf_action_save = QAction("Save Non-Associated...", self)
+        self._ekf_action_save.triggered.connect(self.save_ekf_unassociated_csv)
+        self._ekf_action_save.setEnabled(False)
+        ekf_menu.addAction(self._ekf_action_save)
+
     def clear_console(self):
         """Clear the console output area"""
         self.console.clear()
@@ -982,7 +1570,7 @@ class MainWindow(QMainWindow):
             # Call load_configuration to reload settings
             config_created, eps, min_samples, confidence_check, min_confidence, freq_weight, max_freq_threshold, \
             lgv_div_weight, max_lgv_threshold, timestamp_weight, max_time_variance, spatial_weight, max_spatial_stddev, \
-            log_radius, db3_radius, reflector_radius, highlight_radius = load_configuration()
+            log_radius, db3_radius, reflector_radius, highlight_radius, ekf_cfg = load_configuration()
             
             # Update global variables (if needed in the future)
             globals()['eps'] = eps
@@ -1001,6 +1589,7 @@ class MainWindow(QMainWindow):
             globals()['db3_radius'] = db3_radius
             globals()['reflector_radius'] = reflector_radius
             globals()['highlight_radius'] = highlight_radius
+            globals()['ekf_config'] = ekf_cfg
 
             # Push new sizes into the viewer so next draw uses them
             self.viewer.log_radius       = log_radius
@@ -1107,7 +1696,91 @@ class MainWindow(QMainWindow):
             self.log_to_console(no_results_msg)
             
         self.log_to_console("=" * 50)
-        
+    # ------------------------------------------------------------------
+    # EKF Viewer — MainWindow methods
+    # ------------------------------------------------------------------
+
+    def start_ekf_viewer(self):
+        """Open settings dialog and (re-)start the EKF reader thread."""
+        global ekf_config
+        dlg = EKFSettingsDialog(ekf_config, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        new_cfg = dlg.get_config()
+        if dlg.config_changed():
+            save_ekf_config(new_cfg)
+            ekf_config = new_cfg
+
+        # Clear any existing EKF visuals (keep map/log dots)
+        self.viewer.clear_ekf_items()
+        self.viewer.ensure_y_flip()
+        self.viewer.set_ekf_follow(True)
+        self.viewer._ekf_zoom_on_first = True
+
+        self._ekf_thread = EKFReaderThread(new_cfg)
+        self._ekf_thread.cycle_data.connect(self.on_ekf_cycle)
+        self._ekf_thread.lgv_number.connect(lambda n: setattr(self, '_ekf_lgv_number', n))
+        self._ekf_thread.connection_status.connect(self.log_to_console)
+        self._ekf_thread.finished.connect(self.on_ekf_stopped)
+        self._ekf_thread.start()
+
+        self._ekf_action_start.setEnabled(False)
+        self._ekf_action_stop.setEnabled(True)
+        self.log_to_console("[INFO] EKF Viewer starting...")
+
+    def on_ekf_cycle(self, lgv_x_mm, lgv_y_mm, lgv_h_cdeg, associated_m, new_unassoc_m, conditions_met, forw_motion, quality):
+        """Handle one EKF data cycle from the reader thread (runs in GUI thread via signal).
+
+        lgv_x_mm / lgv_y_mm : LGV position already in mm (TC3 Pos.X/Y PLC symbol).
+        associated_m / new_unassoc_m : reflector worldX/Y in metres → convert ×1000 to mm.
+        """
+        refl_scale = 1000.0   # reflector world coords: metres → mm
+        assoc_mm   = [(x * refl_scale, y * refl_scale, lid) for x, y, lid in associated_m]
+        unassoc_mm = [(x * refl_scale, y * refl_scale) for x, y in new_unassoc_m]
+
+        self.viewer.update_lgv_arrow(lgv_x_mm, lgv_y_mm, lgv_h_cdeg, forw_motion, quality)
+        self.viewer.update_associated_reflectors(assoc_mm)
+        if unassoc_mm:
+            self.viewer.add_unassociated_reflectors(unassoc_mm, lgv_x_mm, lgv_y_mm)
+            self._ekf_action_save.setEnabled(True)
+
+    def stop_ekf_viewer(self):
+        """Request the EKF reader thread to stop gracefully."""
+        if self._ekf_thread is not None:
+            self._ekf_thread.stop()
+        self.viewer.set_ekf_follow(False)
+        self._ekf_action_stop.setEnabled(False)
+        self.log_to_console("[INFO] EKF Viewer stopping...")
+
+    def on_ekf_stopped(self):
+        """Called when the EKF reader thread has fully finished."""
+        self._ekf_thread = None
+        self._ekf_action_start.setEnabled(True)
+        self._ekf_action_stop.setEnabled(False)
+        self.log_to_console("[INFO] EKF Viewer stopped.")
+
+    def save_ekf_unassociated_csv(self):
+        """Save accumulated non-associated reflector data to a CSV file."""
+        data = self.viewer.ekf_unassociated_data
+        if not data:
+            self.log_to_console("[WARNING] No non-associated data to save.")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Non-Associated Reflectors", "", "CSV Files (*.csv)"
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Lgv", "Timestamp", "WorldX", "WorldY", "LgvX", "LgvY"])
+                for timestamp, x_mm, y_mm, lgv_x_mm, lgv_y_mm in data:
+                    writer.writerow([self._ekf_lgv_number, timestamp, x_mm, y_mm, lgv_x_mm, lgv_y_mm])
+            self.log_to_console(f"[INFO] Saved {len(data)} non-associated reflector(s) to: {file_path}")
+        except Exception as e:
+            self.log_to_console(f"[ERROR] Failed to save CSV: {e}")
+
     def log_to_console(self, message):
         """Add message to the embedded console"""
         self.console.append(message)
@@ -1202,7 +1875,7 @@ def apply_dark_theme(app):
 if __name__ == "__main__":
     config_created, eps, min_samples, confidence_check, min_confidence, freq_weight, max_freq_threshold, \
     lgv_div_weight, max_lgv_threshold, timestamp_weight, max_time_variance, spatial_weight, max_spatial_stddev, \
-    log_radius, db3_radius, reflector_radius, highlight_radius = load_configuration()
+    log_radius, db3_radius, reflector_radius, highlight_radius, ekf_config = load_configuration()
 
     app = QApplication(sys.argv)
     apply_dark_theme(app)

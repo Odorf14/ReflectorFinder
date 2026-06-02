@@ -324,6 +324,9 @@ def generate_configfile():
     lgvPosY = ET.SubElement(symbols_tc3, "LgvPosY")
     ET.SubElement(lgvPosY, "Symbol").text = "LibraryInterfaces.LGV.Guid.Info.Pos.Y"
 
+    numLGV = ET.SubElement(symbols_tc3, "NumLGV")
+    ET.SubElement(numLGV, "Symbol").text = "LibraryInterfaces.LGV.Info.NumLGV"
+
     reflectors = ET.SubElement(symbols_tc3, "Reflectors")
     ET.SubElement(reflectors, "Symbol").text = "Sys_ExternalLocalization.extReflectorSet[1].reflectors"
 
@@ -466,6 +469,14 @@ def main():
         if not isNotMoving_bypass: isNotMoving_symbol = plc.get_symbol(symbols_tc3["IsNotMoving"][0])
         LgvPosX_symbol = plc.get_symbol(symbols_tc3["LgvPosX"][0])
         LgvPosY_symbol = plc.get_symbol(symbols_tc3["LgvPosY"][0])
+
+        # Read LGV number directly from PLC for TC3 (overrides extract_lgv_number)
+        if "NumLGV" in symbols_tc3:
+            try:
+                lgv_num = int(plc.get_symbol(symbols_tc3["NumLGV"][0]).read())
+                print(f"[INFO] LGV number from PLC: {lgv_num}")
+            except Exception as e:
+                print(f"[WARNING] Could not read NumLGV from PLC: {e}. Using {lgv_num}.")
         #reflectors_symbol = plc.get_symbol(symbols_tc3["Reflectors"][0])
         
     
