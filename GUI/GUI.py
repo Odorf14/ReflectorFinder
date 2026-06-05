@@ -731,6 +731,10 @@ class DXFViewer(QGraphicsView):
         self.ekf_unassociated_data = []   # list of (timestamp, x_mm, y_mm, lgv_x_mm, lgv_y_mm)
         self._ekf_zoom_on_first = False    # zoom in to LGV on first arrow update
 
+        # Analysis state
+        self.associated_reflector_ids = set()   # IDs loaded from associated-reflectors logs
+        self.unused_reflector_items = []        # graphics items for never-seen reflectors
+
         # Initialize empty scene with dark background
         self.setBackgroundBrush(QColor(50, 50, 50))
 
@@ -879,7 +883,7 @@ class DXFViewer(QGraphicsView):
             return
 
         self.layout_reflectors = reflector_rows
-        self.visualize_layout_reflectors([(row[1], row[2]) for row in reflector_rows])
+        self.visualize_layout_reflectors(reflector_rows)
 
         msg = (f"[INFO] Metadata loaded: {len(reflector_rows)} reflectors. Loading background geometry...")
         print(msg)
@@ -985,6 +989,68 @@ class DXFViewer(QGraphicsView):
         print(msg)
         self.status_updated.emit(msg)
 
+    def clear_unused_reflectors(self):
+        """Remove never-seen reflector markers from the scene."""
+        for item in self.unused_reflector_items:
+            self.scene.removeItem(item)
+        self.unused_reflector_items.clear()
+
+    def visualize_unused_reflectors(self, unused_reflectors):
+        """Draw yellow markers with ID labels for reflectors never seen in associated logs.
+
+        unused_reflectors: list of (id, x, y) tuples.
+        """
+        self.clear_unused_reflectors()
+
+        if not unused_reflectors:
+            return
+
+        circle_radius = self.highlight_radius
+        center_radius = self.reflector_radius
+
+        yellow_brush = QColor(255, 200, 0, 80)
+        yellow_pen   = QPen(QColor(255, 200, 0, 220), 3)
+        white_brush  = QColor(255, 255, 255, 255)
+        white_pen    = QPen(QColor(255, 255, 255, 255), 2)
+
+        flip_tf = QTransform.fromScale(1, -1)
+        label_font = QFont("Arial")
+        label_font.setPointSizeF(max(1.0, center_radius * 2.5))
+
+        for rid, x, y in unused_reflectors:
+            tooltip = f"ID: {rid}\nX: {x:.1f}\nY: {y:.1f}\n(Never seen)"
+
+            circle = QGraphicsEllipseItem(
+                x - circle_radius, y - circle_radius,
+                circle_radius * 2, circle_radius * 2
+            )
+            circle.setPen(yellow_pen)
+            circle.setBrush(yellow_brush)
+            circle.setZValue(10)
+            circle.setToolTip(tooltip)
+
+            center = QGraphicsEllipseItem(
+                x - center_radius, y - center_radius,
+                center_radius * 2, center_radius * 2
+            )
+            center.setPen(white_pen)
+            center.setBrush(white_brush)
+            center.setZValue(11)
+            center.setToolTip(tooltip)
+
+            label = QGraphicsSimpleTextItem(str(rid))
+            label.setFont(label_font)
+            label.setBrush(QColor(255, 255, 100))
+            label.setTransform(flip_tf)
+            label.setPos(x + center_radius * 1.5, y + center_radius * 0.5)
+            label.setZValue(12)
+            label.setToolTip(tooltip)
+
+            self.scene.addItem(circle)
+            self.scene.addItem(center)
+            self.scene.addItem(label)
+            self.unused_reflector_items.extend([circle, center, label])
+
     def clear_layout(self):
         """Clear layout reflector visualizations, background geometry and db3 data from the scene"""
         n_reflectors = len(self.layoutReflector_items)
@@ -997,6 +1063,8 @@ class DXFViewer(QGraphicsView):
         for item in self.background_items:
             self.scene.removeItem(item)
         self.background_items.clear()
+
+        self.clear_unused_reflectors()
 
         self.layout_reflectors = []
         self.db3_loaded = False
@@ -1062,7 +1130,7 @@ class DXFViewer(QGraphicsView):
         self.status_updated.emit(msg)
         
     def visualize_layout_reflectors(self, layout_reflectors):
-        """Create blue dots for layout reflectors"""
+        """Create blue dots for layout reflectors. layout_reflectors: list of (id, x, y) tuples."""
         dot_radius = self.db3_radius
         dot_pen = QPen()
         dot_pen.setWidth(0)
@@ -1074,11 +1142,12 @@ class DXFViewer(QGraphicsView):
         # Create dots in batches
         layoutReflector_items_to_add = []
         
-        for x, y in layout_reflectors:
+        for rid, x, y in layout_reflectors:
             ellipse = QGraphicsEllipseItem(x - dot_radius / 2, y - dot_radius / 2, dot_radius, dot_radius)
             ellipse.setPen(dot_pen)
             ellipse.setBrush(blue_color)
             ellipse.setZValue(2)
+            ellipse.setToolTip(f"ID: {rid}\nX: {x:.1f}\nY: {y:.1f}")
             
             self.layoutReflector_items.append(ellipse)
             layoutReflector_items_to_add.append(ellipse)
@@ -1096,6 +1165,65 @@ class DXFViewer(QGraphicsView):
         msg = f"[INFO] Layout reflectors drawn: {len(layout_reflectors)} marker(s)."
         print(msg)
         self.status_updated.emit(msg)
+
+    def apply_visualization_resize(self, old_cfg, new_cfg):
+        """Resize existing scene items to reflect updated visualization settings.
+        Only touches items whose corresponding radius actually changed."""
+
+        def _resize(item, new_diameter):
+            """Keep the item's centre fixed; update bounding rect to new_diameter x new_diameter."""
+            c = item.rect().center()
+            h = new_diameter / 2.0
+            item.setRect(c.x() - h, c.y() - h, new_diameter, new_diameter)
+
+        log_changed  = old_cfg['log_radius']      != new_cfg['log_radius']
+        db3_changed  = old_cfg['db3_radius']       != new_cfg['db3_radius']
+        refl_changed = old_cfg['reflector_radius'] != new_cfg['reflector_radius']
+        hl_changed   = old_cfg['highlight_radius'] != new_cfg['highlight_radius']
+
+        if log_changed:
+            d = new_cfg['log_radius']
+            for item in self.dot_items:
+                _resize(item, d)
+
+        if db3_changed:
+            d = new_cfg['db3_radius']
+            for item in self.layoutReflector_items:
+                _resize(item, d)
+
+        if hl_changed or refl_changed:
+            # reflector_items: pairs [highlight_circle, center_dot, ...]
+            new_hl   = new_cfg['highlight_radius']
+            new_refl = new_cfg['reflector_radius']
+            for i in range(0, len(self.reflector_items) - 1, 2):
+                if hl_changed:
+                    _resize(self.reflector_items[i],     new_hl * 2)
+                if refl_changed:
+                    _resize(self.reflector_items[i + 1], new_refl * 2)
+
+        if refl_changed:
+            # EKF unassociated red dots: radius = reflector_radius * 4
+            d = new_cfg['reflector_radius'] * 8
+            for item in self.ekf_unassociated_items:
+                _resize(item, d)
+
+        if hl_changed or refl_changed:
+            # unused_reflector_items: triples [outer_circle, center_dot, label, ...]
+            new_hl   = new_cfg['highlight_radius']
+            new_refl = new_cfg['reflector_radius']
+            new_font = QFont("Arial")
+            new_font.setPointSizeF(max(1.0, new_refl * 2.5))
+            for i in range(0, len(self.unused_reflector_items), 3):
+                outer  = self.unused_reflector_items[i]
+                center = self.unused_reflector_items[i + 1]
+                label  = self.unused_reflector_items[i + 2]
+                c = center.rect().center()
+                if hl_changed:
+                    _resize(outer, new_hl * 2)
+                if refl_changed:
+                    _resize(center, new_refl * 2)
+                    label.setFont(new_font)
+                    label.setPos(c.x() + new_refl * 1.5, c.y() + new_refl * 0.5)
 
     # ------------------------------------------------------------------
     # EKF Viewer — view helpers
@@ -1235,6 +1363,13 @@ class DXFViewer(QGraphicsView):
             self.ekf_unassociated_data.append(
                 (timestamp, round(x), round(y), round(lgv_x_mm), round(lgv_y_mm))
             )
+
+    def clear_ekf_unassociated(self):
+        """Remove only the accumulated non-associated reflector dots from the scene."""
+        for item in self.ekf_unassociated_items:
+            self.scene.removeItem(item)
+        self.ekf_unassociated_items.clear()
+        self.ekf_unassociated_data.clear()
 
     def clear_ekf_items(self):
         """Remove all EKF viewer visual elements and reset EKF state."""
@@ -1638,10 +1773,15 @@ class MainWindow(QMainWindow):
         load_layout_action.triggered.connect(self.load_layout_file)
         file_menu.addAction(load_layout_action)
 
-        # Load CSV TC3 action
-        load_csv_tc3_action = QAction("Load Logs", self)
+        # Load unassociated reflectors CSV (TC3 format)
+        load_csv_tc3_action = QAction("Load Non-Associated Logs", self)
         load_csv_tc3_action.triggered.connect(self.load_csv_files_tc3)
         file_menu.addAction(load_csv_tc3_action)
+
+        # Load associated reflectors IDs log
+        load_assoc_action = QAction("Load Associated Logs", self)
+        load_assoc_action.triggered.connect(self.load_associated_ids)
+        file_menu.addAction(load_assoc_action)
 
         file_menu.addSeparator()
         
@@ -1688,6 +1828,11 @@ class MainWindow(QMainWindow):
         find_tc3_reflectors_action.triggered.connect(self.find_reflectors_placeholder)
         analysis_menu.addAction(find_tc3_reflectors_action)
 
+        # Check not-used reflectors against loaded associated IDs
+        check_unused_action = QAction("Check Not-Used Reflectors", self)
+        check_unused_action.triggered.connect(self.check_not_used_reflectors)
+        analysis_menu.addAction(check_unused_action)
+
         # Analysis Settings
         analysis_settings_action = QAction("Analysis Settings", self)
         analysis_settings_action.triggered.connect(self.open_analysis_settings)
@@ -1716,6 +1861,11 @@ class MainWindow(QMainWindow):
         self._ekf_action_save.triggered.connect(self.save_ekf_unassociated_csv)
         self._ekf_action_save.setEnabled(False)
         ekf_menu.addAction(self._ekf_action_save)
+
+        self._ekf_action_clear_unassoc = QAction("Clear Non-Associated Points", self)
+        self._ekf_action_clear_unassoc.triggered.connect(self._clear_ekf_unassoc_handler)
+        self._ekf_action_clear_unassoc.setEnabled(False)
+        ekf_menu.addAction(self._ekf_action_clear_unassoc)
 
     def clear_console(self):
         """Clear the console output area"""
@@ -1774,6 +1924,72 @@ class MainWindow(QMainWindow):
         if file_paths:
             self.viewer.load_csv_files_async(file_paths)
 
+    def load_associated_ids(self):
+        """Load one or more associated-reflectors CSV files (column: ReflectorID) and
+        accumulate the IDs into viewer.associated_reflector_ids."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open Associated Reflectors Log(s)", "", "CSV Files (*.csv)"
+        )
+        if not file_paths:
+            return
+
+        before = len(self.viewer.associated_reflector_ids)
+        for file_path in file_paths:
+            try:
+                with open(file_path, 'r', newline='') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        if 'ReflectorID' in row:
+                            try:
+                                self.viewer.associated_reflector_ids.add(int(row['ReflectorID']))
+                            except (ValueError, KeyError):
+                                pass
+            except Exception as e:
+                self.log_to_console(f"[ERROR] Could not read {os.path.basename(file_path)}: {e}")
+
+        added = len(self.viewer.associated_reflector_ids) - before
+        msg = (
+            f"[INFO] Associated IDs loaded: {added} new, "
+            f"{len(self.viewer.associated_reflector_ids)} total unique ID(s) from "
+            f"{len(file_paths)} file(s)."
+        )
+        print(msg)
+        self.log_to_console(msg)
+
+    def check_not_used_reflectors(self):
+        """Compare layout reflectors against loaded associated IDs and highlight those never seen."""
+        from ReflectorFinder import findUnusedReflectors
+
+        if not self.viewer.layout_reflectors:
+            self.log_to_console("[ERROR] No layout loaded. Please load a db3 layout first.")
+            return
+        if not self.viewer.associated_reflector_ids:
+            self.log_to_console(
+                "[ERROR] No associated IDs loaded. "
+                "Use File → Load Associated Logs to load a Logger associated-reflectors file."
+            )
+            return
+
+        unused = findUnusedReflectors(
+            self.viewer.associated_reflector_ids,
+            self.viewer.layout_reflectors
+        )
+
+        self.log_to_console(
+            f"\nNEVER-SEEN REFLECTORS  ({len(unused)} / {len(self.viewer.layout_reflectors)} in layout)"
+        )
+        self.log_to_console("=" * 55)
+
+        if unused:
+            for rid, x, y in unused:
+                self.log_to_console(f"  ID {rid:>6}  X={x:>10.1f}  Y={y:>10.1f}")
+            self.log_to_console(f"\nTotal: {len(unused)} reflector(s) never seen.")
+            self.viewer.visualize_unused_reflectors(unused)
+        else:
+            self.log_to_console("  All layout reflectors were seen at least once.")
+
+        self.log_to_console("=" * 55)
+
     def open_analysis_settings(self):
         """Open the Analysis Settings dialog and persist any changes."""
         cfg = {
@@ -1801,16 +2017,18 @@ class MainWindow(QMainWindow):
 
     def open_visualization_settings(self):
         """Open the Visualization Settings dialog and persist any changes."""
-        cfg = {
+        old_cfg = {
             "log_radius":       globals()['log_radius'],
             "db3_radius":       globals()['db3_radius'],
             "reflector_radius": globals()['reflector_radius'],
             "highlight_radius": globals()['highlight_radius'],
         }
-        dlg = VisualizationSettingsDialog(cfg, self)
+        dlg = VisualizationSettingsDialog(old_cfg, self)
         if dlg.exec_() != QDialog.Accepted:
             return
         new_cfg = dlg.get_config()
+        if new_cfg == old_cfg:
+            return
         save_visualization_config(new_cfg)
         globals()['log_radius']       = new_cfg["log_radius"]
         globals()['db3_radius']       = new_cfg["db3_radius"]
@@ -1820,6 +2038,7 @@ class MainWindow(QMainWindow):
         self.viewer.db3_radius        = new_cfg["db3_radius"]
         self.viewer.reflector_radius  = new_cfg["reflector_radius"]
         self.viewer.highlight_radius  = new_cfg["highlight_radius"]
+        self.viewer.apply_visualization_resize(old_cfg, new_cfg)
         self.log_to_console("[INFO] Visualization settings saved.")
     
     def load_layout_file(self):
@@ -1928,6 +2147,7 @@ class MainWindow(QMainWindow):
         if unassoc_mm:
             self.viewer.add_unassociated_reflectors(unassoc_mm, lgv_x_mm, lgv_y_mm)
             self._ekf_action_save.setEnabled(True)
+            self._ekf_action_clear_unassoc.setEnabled(True)
 
     def stop_ekf_viewer(self):
         """Request the EKF reader thread to stop gracefully."""
@@ -1964,6 +2184,13 @@ class MainWindow(QMainWindow):
             self.log_to_console(f"[INFO] Saved {len(data)} non-associated reflector(s) to: {file_path}")
         except Exception as e:
             self.log_to_console(f"[ERROR] Failed to save CSV: {e}")
+
+    def _clear_ekf_unassoc_handler(self):
+        """Clear accumulated non-associated EKF dots and reset related actions."""
+        self.viewer.clear_ekf_unassociated()
+        self._ekf_action_clear_unassoc.setEnabled(False)
+        self._ekf_action_save.setEnabled(False)
+        self.log_to_console("[INFO] Non-associated EKF points cleared.")
 
     def log_to_console(self, message):
         """Add message to the embedded console"""
