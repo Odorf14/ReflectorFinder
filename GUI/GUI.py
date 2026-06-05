@@ -11,10 +11,11 @@ from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsLineItem, QGraphicsEllipseItem,
     QGraphicsPolygonItem, QGraphicsSimpleTextItem,
     QWidget, QVBoxLayout, QProgressDialog, QTextEdit, QSplitter,
-    QDialog, QFormLayout, QLabel, QLineEdit, QSpinBox, QCheckBox,
-    QPushButton, QHBoxLayout, QScrollArea, QGroupBox, QDialogButtonBox
+    QDialog, QFormLayout, QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox,
+    QPushButton, QHBoxLayout, QGridLayout, QScrollArea, QGroupBox, QDialogButtonBox,
+    QSplashScreen
 )
-from PyQt5.QtGui import QPen, QPainter, QColor, QPolygonF, QFont, QTransform
+from PyQt5.QtGui import QPen, QPainter, QColor, QPolygonF, QFont, QTransform, QIcon, QPixmap
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF
 import numpy as np
 from ReflectorFinder import (analyzeReflectors, correctPointPos)
@@ -89,114 +90,6 @@ class CSVLoaderThread(QThread):
                 
                 if row_count > 0:
                     print(f"[INFO] {csv_path}: {valid_rows}/{row_count} valid rows processed")
-                else:
-                    print(f"[WARNING] {csv_path}: No rows found in file")
-                        
-        except Exception as e:
-            print(f"[ERROR] Failed to load {csv_path}: {e}")
-            
-        return points, events
-
-
-class CSVLoaderThreadTC2(QThread):
-    """Background thread for loading CSV files with TC2 filtering (layer-based)"""
-    progress = pyqtSignal(int)
-    file_loaded = pyqtSignal(str, list, list)  # filename, points, events
-    finished_loading = pyqtSignal()
-    
-    def __init__(self, file_paths, freeshapes):
-        super().__init__()
-        self.file_paths = file_paths
-        self.freeshapes = freeshapes  # List of (ID, X1, X2, Y1, Y2)
-        
-    def run(self):
-        total_files = len(self.file_paths)
-        
-        for i, csv_path in enumerate(self.file_paths):
-            points, events = self.load_single_csv_with_filter(csv_path)
-            if points:  # Only emit if data was loaded
-                self.file_loaded.emit(csv_path, points, events)
-            
-            progress_percent = int((i + 1) * 100 / total_files)
-            self.progress.emit(progress_percent)
-        
-        self.finished_loading.emit()
-    
-    def point_in_freeshape(self, x, y, x1, x2, y1, y2):
-        """Check if point (x, y) is inside the rectangle defined by (x1, x2, y1, y2)"""
-        min_x = min(x1, x2)
-        max_x = max(x1, x2)
-        min_y = min(y1, y2)
-        max_y = max(y1, y2)
-        return min_x <= x <= max_x and min_y <= y <= max_y
-    
-    def find_containing_freeshape(self, x, y):
-        """Find the FreeShape ID that contains point (x, y), returns None if not found"""
-        for freeshape in self.freeshapes:
-            shape_id, x1, x2, y1, y2 = freeshape
-            if self.point_in_freeshape(x, y, x1, x2, y1, y2):
-                return shape_id
-        return None
-    
-    def load_single_csv_with_filter(self, csv_path):
-        """Load CSV data with TC2 filtering based on FreeShapes"""
-        points = []
-        events = []
-
-        try:
-            with open(csv_path, 'r', newline='') as csvfile:
-                reader = csv.DictReader(csvfile)
-                
-                # Check if we have the expected columns
-                if reader.fieldnames:
-                    expected_cols = ["Lgv", "Timestamp", "WorldX", "WorldY", "LgvX", "LgvY"]
-                    missing_cols = [col for col in expected_cols if col not in reader.fieldnames]
-                    if missing_cols:
-                        print(f"[WARNING] Missing columns in {csv_path}: {missing_cols}")
-                        print(f"[DEBUG] Available columns: {reader.fieldnames}")
-                
-                row_count = 0
-                valid_rows = 0
-                filtered_rows = 0
-                
-                # Process rows efficiently
-                for row in reader:
-                    row_count += 1
-                    try:
-                        lgv_id = int(row['Lgv'])
-                        timestamp = row['Timestamp']
-                        worldx = float(row['WorldX'])
-                        worldy = float(row['WorldY'])
-                        lgvx = float(row['LgvX'])
-                        lgvy = float(row['LgvY'])
-                        
-                        # TC2 Filtering: Check if LGV position and detected reflector are in same layer
-                        lgv_layer = self.find_containing_freeshape(lgvx, lgvy)
-                        
-                        if lgv_layer is not None:
-                            # LGV is in a layer, check if detected reflector is in the same layer
-                            reflector_layer = self.find_containing_freeshape(worldx, worldy)
-                            
-                            if reflector_layer == lgv_layer:
-                                # Both in same layer, keep the point
-                                points.append((worldx, worldy))
-                                events.append((lgv_id, timestamp, worldx, worldy, lgvx, lgvy))
-                                valid_rows += 1
-                            else:
-                                filtered_rows += 1
-                        else:
-                            # LGV not in any layer, filter out
-                            filtered_rows += 1
-                        
-                    except (ValueError, KeyError) as e:
-                        # Log first few errors for debugging
-                        if row_count <= 3:
-                            print(f"[DEBUG] Row {row_count} error in {csv_path}: {e}")
-                            print(f"[DEBUG] Row data: {dict(row)}")
-                        continue
-                
-                if row_count > 0:
-                    print(f"[INFO] {csv_path}: {valid_rows}/{row_count} valid rows (filtered out: {filtered_rows})")
                 else:
                     print(f"[WARNING] {csv_path}: No rows found in file")
                         
@@ -426,6 +319,208 @@ class EKFSettingsDialog(QDialog):
 
 
 ######################################################
+# Analysis Settings Dialog
+######################################################
+
+class AnalysisSettingsDialog(QDialog):
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Analysis Settings")
+        self.setMinimumWidth(560)
+
+        outer = QVBoxLayout(self)
+
+        # --- DBSCAN group ---
+        dbscan_group = QGroupBox("DBSCAN")
+        dbscan_layout = QFormLayout(dbscan_group)
+
+        self.eps_spin = QDoubleSpinBox()
+        self.eps_spin.setRange(0.1, 1000.0)
+        self.eps_spin.setDecimals(2)
+        self.eps_spin.setSingleStep(0.5)
+        self.eps_spin.setValue(cfg.get("eps", 3.5))
+
+        self.min_samples_spin = QSpinBox()
+        self.min_samples_spin.setRange(1, 100000)
+        self.min_samples_spin.setValue(cfg.get("min_samples", 30))
+
+        dbscan_layout.addRow("EPS:", self.eps_spin)
+        dbscan_layout.addRow("Min Samples:", self.min_samples_spin)
+        outer.addWidget(dbscan_group)
+
+        # --- Confidence Filter group ---
+        conf_group = QGroupBox("Confidence Filter")
+        conf_layout = QFormLayout(conf_group)
+
+        self.conf_check = QCheckBox()
+        self.conf_check.setChecked(cfg.get("confidence_check", True))
+
+        self.min_conf_spin = QDoubleSpinBox()
+        self.min_conf_spin.setRange(0.0, 1.0)
+        self.min_conf_spin.setDecimals(2)
+        self.min_conf_spin.setSingleStep(0.05)
+        self.min_conf_spin.setValue(cfg.get("min_confidence", 0.8))
+
+        conf_layout.addRow("Enable Confidence Check:", self.conf_check)
+        conf_layout.addRow("Min Confidence:", self.min_conf_spin)
+        outer.addWidget(conf_group)
+
+        # --- Score Weights & Thresholds group (grid: weight | threshold per row) ---
+        weights_group = QGroupBox("Score Weights && Thresholds")
+        grid = QGridLayout(weights_group)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+
+        def _dspin(val, lo=0.0, hi=1.0, decimals=2, step=0.05):
+            s = QDoubleSpinBox()
+            s.setRange(lo, hi)
+            s.setDecimals(decimals)
+            s.setSingleStep(step)
+            s.setValue(val)
+            return s
+
+        self.freq_weight_spin    = _dspin(cfg.get("freq_weight", 0.15))
+        self.max_freq_spin       = _dspin(cfg.get("max_freq_threshold", 50.0),  lo=1.0, hi=10000.0, decimals=1, step=5.0)
+        self.lgv_div_weight_spin = _dspin(cfg.get("lgv_div_weight", 0.35))
+        self.max_lgv_spin        = _dspin(cfg.get("max_lgv_threshold", 10.0),   lo=1.0, hi=1000.0,  decimals=1, step=1.0)
+        self.ts_weight_spin      = _dspin(cfg.get("timestamp_weight", 0.25))
+        self.max_time_spin       = _dspin(cfg.get("max_time_variance", 7200.0), lo=1.0, hi=86400.0, decimals=0, step=600.0)
+        self.spatial_weight_spin = _dspin(cfg.get("spatial_weight", 0.25))
+        self.max_spatial_spin    = _dspin(cfg.get("max_spatial_stddev", 10.0),  lo=0.1, hi=10000.0, decimals=1, step=1.0)
+
+        # Header row
+        hdr_weight = QLabel("<b>Weight</b>")
+        hdr_thresh = QLabel("<b>Max Threshold</b>")
+        hdr_weight.setAlignment(Qt.AlignCenter)
+        hdr_thresh.setAlignment(Qt.AlignCenter)
+        grid.addWidget(hdr_weight, 0, 1)
+        grid.addWidget(hdr_thresh, 0, 3)
+
+        rows = [
+            ("Frequency",           self.freq_weight_spin,    "Max Frequency",         self.max_freq_spin),
+            ("LGV Diversity",       self.lgv_div_weight_spin, "Max LGV Count",         self.max_lgv_spin),
+            ("Timestamp",           self.ts_weight_spin,      "Max Time Variance (s)", self.max_time_spin),
+            ("Spatial Distribution",self.spatial_weight_spin, "Max Spatial Std Dev",   self.max_spatial_spin),
+        ]
+        for r, (wlabel, wspin, tlabel, tspin) in enumerate(rows, start=1):
+            grid.addWidget(QLabel(wlabel + ":"),  r, 0)
+            grid.addWidget(wspin,                 r, 1)
+            grid.addWidget(QLabel(tlabel + ":"),  r, 2)
+            grid.addWidget(tspin,                 r, 3)
+
+        outer.addWidget(weights_group)
+
+        # --- Warning label ---
+        self._warning_label = QLabel()
+        self._warning_label.setStyleSheet("color: #ff6b6b; font-style: italic;")
+        self._warning_label.setAlignment(Qt.AlignCenter)
+        outer.addWidget(self._warning_label)
+
+        # --- Buttons ---
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._ok_button = btn_box.button(QDialogButtonBox.Ok)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        outer.addWidget(btn_box)
+
+        # Connect weight spinboxes to validation
+        for wspin in (self.freq_weight_spin, self.lgv_div_weight_spin,
+                      self.ts_weight_spin, self.spatial_weight_spin):
+            wspin.valueChanged.connect(self._validate_weights)
+
+        self._validate_weights()
+
+    def _validate_weights(self):
+        total = round(
+            self.freq_weight_spin.value() +
+            self.lgv_div_weight_spin.value() +
+            self.ts_weight_spin.value() +
+            self.spatial_weight_spin.value(),
+            6
+        )
+        ok = abs(total - 1.0) < 1e-4
+        self._ok_button.setEnabled(ok)
+        if ok:
+            self._warning_label.setText("")
+        else:
+            self._warning_label.setText(
+                f"Weights must sum to 1.00 (current sum: {total:.4f})"
+            )
+
+    def get_config(self):
+        return {
+            "eps":               self.eps_spin.value(),
+            "min_samples":       self.min_samples_spin.value(),
+            "confidence_check":  self.conf_check.isChecked(),
+            "min_confidence":    self.min_conf_spin.value(),
+            "freq_weight":       self.freq_weight_spin.value(),
+            "max_freq_threshold":self.max_freq_spin.value(),
+            "lgv_div_weight":    self.lgv_div_weight_spin.value(),
+            "max_lgv_threshold": self.max_lgv_spin.value(),
+            "timestamp_weight":  self.ts_weight_spin.value(),
+            "max_time_variance": self.max_time_spin.value(),
+            "spatial_weight":    self.spatial_weight_spin.value(),
+            "max_spatial_stddev":self.max_spatial_spin.value(),
+        }
+
+
+######################################################
+# Visualization Settings Dialog
+######################################################
+
+class VisualizationSettingsDialog(QDialog):
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Visualization Settings")
+        self.setMinimumWidth(360)
+
+        outer = QVBoxLayout(self)
+
+        def _ispin(val, lo=1, hi=100000):
+            s = QSpinBox()
+            s.setRange(lo, hi)
+            s.setValue(val)
+            return s
+
+        # --- Logged Points ---
+        log_group = QGroupBox("Logged Points")
+        log_layout = QFormLayout(log_group)
+        self.log_radius_spin = _ispin(cfg.get("log_radius", 15))
+        log_layout.addRow("Point Radius:", self.log_radius_spin)
+        outer.addWidget(log_group)
+
+        # --- DB3 Reflector ---
+        db3_group = QGroupBox("DB3 Reflector")
+        db3_layout = QFormLayout(db3_group)
+        self.db3_radius_spin = _ispin(cfg.get("db3_radius", 100))
+        db3_layout.addRow("Point Radius:", self.db3_radius_spin)
+        outer.addWidget(db3_group)
+
+        # --- Found Reflector ---
+        found_group = QGroupBox("Found Reflector")
+        found_layout = QFormLayout(found_group)
+        self.reflector_radius_spin = _ispin(cfg.get("reflector_radius", 32))
+        self.highlight_radius_spin = _ispin(cfg.get("highlight_radius", 1750))
+        found_layout.addRow("Center Dot Radius:", self.reflector_radius_spin)
+        found_layout.addRow("Highlight Circle Radius:", self.highlight_radius_spin)
+        outer.addWidget(found_group)
+
+        # --- Buttons ---
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        outer.addWidget(btn_box)
+
+    def get_config(self):
+        return {
+            "log_radius":       self.log_radius_spin.value(),
+            "db3_radius":       self.db3_radius_spin.value(),
+            "reflector_radius": self.reflector_radius_spin.value(),
+            "highlight_radius": self.highlight_radius_spin.value(),
+        }
+
+
+######################################################
 # EKF Reader Thread
 ######################################################
 
@@ -609,7 +704,6 @@ class DXFViewer(QGraphicsView):
         
         # CSV loading thread
         self.csv_loader_thread = None
-        self.csv_loader_thread_tc2 = None
         self.progress_dialog = None
 
         # Background geometry loader thread
@@ -617,7 +711,6 @@ class DXFViewer(QGraphicsView):
         
         # Database layout data
         self.layout_reflectors = []  # Store reflectors from db3
-        self.layout_freeshapes = []  # Store FreeShapes from db3
         self.background_items = []   # Store background geometry items from db3
         self.db3_loaded = False  # Flag to track if db3 has been loaded
 
@@ -660,27 +753,6 @@ class DXFViewer(QGraphicsView):
         self.csv_loader_thread.finished_loading.connect(self.on_all_csv_loaded)
         self.csv_loader_thread.start()
     
-    def load_csv_files_async_tc2(self, csv_paths):
-        """Load multiple CSV files with TC2 filtering (layer-based)"""
-        if self.csv_loader_thread_tc2 and self.csv_loader_thread_tc2.isRunning():
-            return
-        
-        msg = f"[INFO] Loading {len(csv_paths)} TC2 log file(s) with layer filtering..."
-        print(msg)
-        self.status_updated.emit(msg)
-
-        # Show progress dialog
-        self.progress_dialog = QProgressDialog("Loading CSV files (TC2 with filtering)...", "Cancel", 0, 100, self)
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
-        self.progress_dialog.show()
-        
-        # Start background loading with filtering
-        self.csv_loader_thread_tc2 = CSVLoaderThreadTC2(csv_paths, self.layout_freeshapes)
-        self.csv_loader_thread_tc2.progress.connect(self.progress_dialog.setValue)
-        self.csv_loader_thread_tc2.file_loaded.connect(self.on_csv_file_loaded)
-        self.csv_loader_thread_tc2.finished_loading.connect(self.on_all_csv_loaded)
-        self.csv_loader_thread_tc2.start()
-        
     def on_csv_file_loaded(self, filename, points, events, correct_points = False):
         """Handle individual CSV file loaded"""
         short_name = os.path.basename(filename)
@@ -784,21 +856,19 @@ class DXFViewer(QGraphicsView):
         self.status_updated.emit(msg)
 
     def load_layout(self, db3_path):
-        """Load reflectors and FreeShapes synchronously (fast), then kick off
+        """Load reflectors synchronously (fast), then kick off
         BackgroundLoaderThread for the heavy geometry work."""
         if self.db3_loaded:
             self.clear_layout()
 
         label = os.path.basename(db3_path)
 
-        # --- Fast sync part: Reflectors + FreeShapes ---
+        # --- Fast sync part: Reflectors ---
         try:
             conn = sqlite3.connect(db3_path)
             cursor = conn.cursor()
             cursor.execute("SELECT ID, X, Y FROM Reflectors")
             reflector_rows = cursor.fetchall()
-            cursor.execute("SELECT ID, X1, X2, Y1, Y2 FROM FreeShapes")
-            freeshape_rows = cursor.fetchall()
             conn.close()
         except Exception as e:
             msg = f"[ERROR] Failed to load layout metadata: {e}"
@@ -807,11 +877,9 @@ class DXFViewer(QGraphicsView):
             return
 
         self.layout_reflectors = reflector_rows
-        self.layout_freeshapes = freeshape_rows
         self.visualize_layout_reflectors([(row[1], row[2]) for row in reflector_rows])
 
-        msg = (f"[INFO] Metadata loaded: {len(reflector_rows)} reflectors, "
-               f"{len(freeshape_rows)} layers. Loading background geometry...")
+        msg = (f"[INFO] Metadata loaded: {len(reflector_rows)} reflectors. Loading background geometry...")
         print(msg)
         self.status_updated.emit(msg)
 
@@ -829,7 +897,7 @@ class DXFViewer(QGraphicsView):
         self._bg_loader.log.connect(lambda m: (print(m), self.status_updated.emit(m)))
         self._bg_loader.finished.connect(
             lambda segs, elps, cnts: self._on_background_loaded(
-                segs, elps, cnts, reflector_rows, freeshape_rows
+                segs, elps, cnts, reflector_rows
             )
         )
         self._bg_loader.start()
@@ -846,7 +914,7 @@ class DXFViewer(QGraphicsView):
                 f"Reading background geometry... {current:,} / {total:,} entities"
             )
 
-    def _on_background_loaded(self, line_segs, ellipses, counts, reflector_rows, freeshape_rows):
+    def _on_background_loaded(self, line_segs, ellipses, counts, reflector_rows):
         """Create QGraphicsItems on the main thread from raw data received from the loader thread."""
         pen = QPen(QColor(170, 170, 170))
         pen.setWidth(0)
@@ -899,7 +967,6 @@ class DXFViewer(QGraphicsView):
 
         msg = (
             f"[INFO] Layout loaded: {len(reflector_rows)} reflectors, "
-            f"{len(freeshape_rows)} layers, "
             f"{len(self.background_items)} background entities."
         )
         print(msg)
@@ -930,7 +997,6 @@ class DXFViewer(QGraphicsView):
         self.background_items.clear()
 
         self.layout_reflectors = []
-        self.layout_freeshapes = []
         self.db3_loaded = False
 
         msg = f"[INFO] Layout cleared ({n_reflectors} reflector markers, {n_bg} background entities removed)."
@@ -1296,12 +1362,43 @@ def generate_configfile():
     tree.write(config_path, encoding='utf-8', xml_declaration=True)
     print(f"[INFO] Generated config file at: {config_path}")
 
+_REQUIRED_CONFIG_PATHS = [
+    "DBSCAN/EPS",
+    "DBSCAN/MinSamples",
+    "ConfidenceScores/ConfidenceCheck",
+    "ConfidenceScores/MinConfidence",
+    "ConfidenceScores/FrequencyScore/Weight",
+    "ConfidenceScores/FrequencyScore/MaxFreqThreshold",
+    "ConfidenceScores/LGVDiversityScore/Weight",
+    "ConfidenceScores/LGVDiversityScore/MaxLGVThreshold",
+    "ConfidenceScores/TimestampScore/Weight",
+    "ConfidenceScores/TimestampScore/MaxTimeVarianceSec",
+    "ConfidenceScores/SpatialDistributionScore/Weight",
+    "ConfidenceScores/SpatialDistributionScore/MaxSpatialStdDev",
+    "GUI_Settings/Logged_Points/PointRadius",
+    "GUI_Settings/DB3_Reflector/PointRadius",
+    "GUI_Settings/Found_Reflector/PointRadius",
+    "GUI_Settings/Found_Reflector/HighlightRadius",
+    "EKF_Viewer/Connection/AmsNetId",
+    "EKF_Viewer/Connection/Port",
+    "EKF_Viewer/Connection/ReadIntervalMs",
+    "EKF_Viewer/Symbols",
+]
+
+def is_config_compatible(root):
+    """Return True if all required XML elements are present in the config."""
+    for path in _REQUIRED_CONFIG_PATHS:
+        if root.find(path) is None:
+            print(f"[WARNING] Missing config element: {path}")
+            return False
+    return True
+
+
 def load_configuration():
     """
     Load configuration from XML file. Generates default config if file doesn't exist.
     Returns:
-        tuple: (config_created, plc_ams_id, plc_ip, port, tc2, remoterun_enable, one_file, log_duration, read_interval, 
-                log_folder, max_log_size, symbols_tc3, symbols_tc2)
+        tuple: (config_created, eps, min_samples, confidence_check, min_confidence, ...)
         symbols is a dict mapping symbol names to (symbol_path, bypass_flag) tuples
     """
     #Normalizar weights
@@ -1314,6 +1411,17 @@ def load_configuration():
         print("[WARNING] Configuration file not found. Generating default config.")
         generate_configfile()
         config_created = True
+    else:
+        try:
+            _tree = ET.parse(config_path)
+            if not is_config_compatible(_tree.getroot()):
+                print("[WARNING] Configuration file is incompatible. Regenerating...")
+                generate_configfile()
+                config_created = True
+        except ET.ParseError:
+            print("[WARNING] Configuration file is malformed. Regenerating...")
+            generate_configfile()
+            config_created = True
 
     tree = ET.parse(config_path)
     root = tree.getroot()
@@ -1409,6 +1517,50 @@ def save_ekf_config(ekf_config):
     print("[INFO] EKF Viewer config saved.")
 
 
+def save_analysis_config(cfg):
+    """Update only the DBSCAN and ConfidenceScores sections of the config XML."""
+    config_path = get_config_path()
+    if not os.path.exists(config_path):
+        return
+    tree = ET.parse(config_path)
+    root = tree.getroot()
+
+    root.find("DBSCAN/EPS").text                                              = str(cfg["eps"])
+    root.find("DBSCAN/MinSamples").text                                       = str(cfg["min_samples"])
+    root.find("ConfidenceScores/ConfidenceCheck").text                        = str(cfg["confidence_check"])
+    root.find("ConfidenceScores/MinConfidence").text                          = str(cfg["min_confidence"])
+    root.find("ConfidenceScores/FrequencyScore/Weight").text                  = str(cfg["freq_weight"])
+    root.find("ConfidenceScores/FrequencyScore/MaxFreqThreshold").text        = str(cfg["max_freq_threshold"])
+    root.find("ConfidenceScores/LGVDiversityScore/Weight").text               = str(cfg["lgv_div_weight"])
+    root.find("ConfidenceScores/LGVDiversityScore/MaxLGVThreshold").text      = str(cfg["max_lgv_threshold"])
+    root.find("ConfidenceScores/TimestampScore/Weight").text                  = str(cfg["timestamp_weight"])
+    root.find("ConfidenceScores/TimestampScore/MaxTimeVarianceSec").text      = str(cfg["max_time_variance"])
+    root.find("ConfidenceScores/SpatialDistributionScore/Weight").text        = str(cfg["spatial_weight"])
+    root.find("ConfidenceScores/SpatialDistributionScore/MaxSpatialStdDev").text = str(cfg["max_spatial_stddev"])
+
+    ET.indent(root, space="  ", level=0)
+    tree.write(config_path, encoding='utf-8', xml_declaration=True)
+    print("[INFO] Analysis config saved.")
+
+
+def save_visualization_config(cfg):
+    """Update only the GUI_Settings section of the config XML."""
+    config_path = get_config_path()
+    if not os.path.exists(config_path):
+        return
+    tree = ET.parse(config_path)
+    root = tree.getroot()
+
+    root.find("GUI_Settings/Logged_Points/PointRadius").text       = str(cfg["log_radius"])
+    root.find("GUI_Settings/DB3_Reflector/PointRadius").text       = str(cfg["db3_radius"])
+    root.find("GUI_Settings/Found_Reflector/PointRadius").text     = str(cfg["reflector_radius"])
+    root.find("GUI_Settings/Found_Reflector/HighlightRadius").text = str(cfg["highlight_radius"])
+
+    ET.indent(root, space="  ", level=0)
+    tree.write(config_path, encoding='utf-8', xml_declaration=True)
+    print("[INFO] Visualization config saved.")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1473,19 +1625,14 @@ class MainWindow(QMainWindow):
         file_menu = menubar.addMenu("File")
 
         #Load layout db3 action
-        load_layout_action = QAction("Load layout", self)
+        load_layout_action = QAction("Load Layout", self)
         load_layout_action.triggered.connect(self.load_layout_file)
         file_menu.addAction(load_layout_action)
 
         # Load CSV TC3 action
-        load_csv_tc3_action = QAction("Load Logs TC3", self)
+        load_csv_tc3_action = QAction("Load Logs", self)
         load_csv_tc3_action.triggered.connect(self.load_csv_files_tc3)
         file_menu.addAction(load_csv_tc3_action)
-        
-        # Load CSV TC2 action
-        load_csv_tc2_action = QAction("Load Logs TC2", self)
-        load_csv_tc2_action.triggered.connect(self.load_csv_files_tc2)
-        file_menu.addAction(load_csv_tc2_action)
 
         file_menu.addSeparator()
         
@@ -1500,12 +1647,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction(clear_reflectors_action)
 
         #Clear db3 action
-        clear_layout_action = QAction("Clear layout", self)
+        clear_layout_action = QAction("Clear Layout", self)
         clear_layout_action.triggered.connect(self.viewer.clear_layout)
         file_menu.addAction(clear_layout_action)
 
         # Clear db3 reflectors only action
-        clear_layout_reflectors_action = QAction("Clear db3 reflectors", self)
+        clear_layout_reflectors_action = QAction("Clear DB3 Reflectors", self)
         clear_layout_reflectors_action.triggered.connect(self.viewer.clear_layout_reflectors)
         file_menu.addAction(clear_layout_reflectors_action)
         
@@ -1515,35 +1662,41 @@ class MainWindow(QMainWindow):
         clear_console_action = QAction("Clear Console", self)
         clear_console_action.triggered.connect(self.clear_console)
         file_menu.addAction(clear_console_action)
-        
+
+        # EDIT MENU
+        edit_menu = menubar.addMenu("Edit")
+
+        vis_settings_action = QAction("Visualization Settings", self)
+        vis_settings_action.triggered.connect(self.open_visualization_settings)
+        edit_menu.addAction(vis_settings_action)
+
         # ANALYSIS MENU
         analysis_menu = menubar.addMenu("Analysis")
         
-        # Find TC2 Reflectors
-        find_tc2_reflectors_action = QAction("Find TC2 Reflectors", self)
-        find_tc2_reflectors_action.triggered.connect(self.reload_configuration)
-        find_tc2_reflectors_action.triggered.connect(self.find_tc2_reflectors)
-        analysis_menu.addAction(find_tc2_reflectors_action)
-        
         # Find TC3 Reflectors
-        find_tc3_reflectors_action = QAction("Find TC3 Reflectors", self)
+        find_tc3_reflectors_action = QAction("Find Reflectors", self)
         find_tc3_reflectors_action.triggered.connect(self.reload_configuration)
         find_tc3_reflectors_action.triggered.connect(self.find_reflectors_placeholder)
         analysis_menu.addAction(find_tc3_reflectors_action)
-        
+
+        # Analysis Settings
+        analysis_settings_action = QAction("Analysis Settings", self)
+        analysis_settings_action.triggered.connect(self.open_analysis_settings)
+        analysis_menu.addAction(analysis_settings_action)
+
         # Reload configuration action
-        reload_config_action = QAction("Reload configuration", self)
+        reload_config_action = QAction("Reload Configuration", self)
         reload_config_action.triggered.connect(self.reload_configuration)
         analysis_menu.addAction(reload_config_action)
 
         # EKF VIEWER MENU
         ekf_menu = menubar.addMenu("EKF Viewer")
 
-        self._ekf_action_start = QAction("Start EKF Viewer", self)
+        self._ekf_action_start = QAction("Start", self)
         self._ekf_action_start.triggered.connect(self.start_ekf_viewer)
         ekf_menu.addAction(self._ekf_action_start)
 
-        self._ekf_action_stop = QAction("Stop EKF Viewer", self)
+        self._ekf_action_stop = QAction("Stop", self)
         self._ekf_action_stop.triggered.connect(self.stop_ekf_viewer)
         self._ekf_action_stop.setEnabled(False)
         ekf_menu.addAction(self._ekf_action_stop)
@@ -1611,39 +1764,61 @@ class MainWindow(QMainWindow):
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Open CSV Files", "", "CSV Files (*.csv)")
         if file_paths:
             self.viewer.load_csv_files_async(file_paths)
-    
-    def load_csv_files_tc2(self):
-        """Load multiple CSV files with TC2 layer-based filtering"""
-        # Check if db3 has been loaded
-        if not self.viewer.db3_loaded:
-            error_msg = "[ERROR] Load layout first before loading TC2 logs."
-            print(error_msg)
-            self.log_to_console(error_msg)
-            return
-        
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "Open CSV Files (TC2)", "", "CSV Files (*.csv)")
-        if file_paths:
-            self.viewer.load_csv_files_async_tc2(file_paths)
 
+    def open_analysis_settings(self):
+        """Open the Analysis Settings dialog and persist any changes."""
+        cfg = {
+            "eps":               globals()['eps'],
+            "min_samples":       globals()['min_samples'],
+            "confidence_check":  globals()['confidence_check'],
+            "min_confidence":    globals()['min_confidence'],
+            "freq_weight":       globals()['freq_weight'],
+            "max_freq_threshold":globals()['max_freq_threshold'],
+            "lgv_div_weight":    globals()['lgv_div_weight'],
+            "max_lgv_threshold": globals()['max_lgv_threshold'],
+            "timestamp_weight":  globals()['timestamp_weight'],
+            "max_time_variance": globals()['max_time_variance'],
+            "spatial_weight":    globals()['spatial_weight'],
+            "max_spatial_stddev":globals()['max_spatial_stddev'],
+        }
+        dlg = AnalysisSettingsDialog(cfg, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_cfg = dlg.get_config()
+        save_analysis_config(new_cfg)
+        for key, val in new_cfg.items():
+            globals()[key] = val
+        self.log_to_console("[INFO] Analysis settings saved.")
+
+    def open_visualization_settings(self):
+        """Open the Visualization Settings dialog and persist any changes."""
+        cfg = {
+            "log_radius":       globals()['log_radius'],
+            "db3_radius":       globals()['db3_radius'],
+            "reflector_radius": globals()['reflector_radius'],
+            "highlight_radius": globals()['highlight_radius'],
+        }
+        dlg = VisualizationSettingsDialog(cfg, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new_cfg = dlg.get_config()
+        save_visualization_config(new_cfg)
+        globals()['log_radius']       = new_cfg["log_radius"]
+        globals()['db3_radius']       = new_cfg["db3_radius"]
+        globals()['reflector_radius'] = new_cfg["reflector_radius"]
+        globals()['highlight_radius'] = new_cfg["highlight_radius"]
+        self.viewer.log_radius        = new_cfg["log_radius"]
+        self.viewer.db3_radius        = new_cfg["db3_radius"]
+        self.viewer.reflector_radius  = new_cfg["reflector_radius"]
+        self.viewer.highlight_radius  = new_cfg["highlight_radius"]
+        self.log_to_console("[INFO] Visualization settings saved.")
+    
     def load_layout_file(self):
-        """Load layout reflectors, FreeShapes and background from db3"""
+        """Load layout reflectors and background geometry from db3."""
         file_path, _ = QFileDialog.getOpenFileName(self, "Open Layout.db3", "", "DB3 Files (*.db3)")
         if file_path:
             self.viewer.load_layout(file_path)
     
-    def find_tc2_reflectors(self):
-        """Find TC2 Reflectors - placeholder for future implementation"""
-        if not self.viewer.db3_loaded:
-            warning_msg = "[WARNING] Load layout first before finding TC2 reflectors."
-            print(warning_msg)
-            self.log_to_console(warning_msg)
-            return
-        
-        # Placeholder for future TC2 reflector finding logic
-        info_msg = "[INFO] TC2 Reflector finding functionality will be implemented here."
-        print(info_msg)
-        self.log_to_console(info_msg)
-            
     def find_reflectors_placeholder(self):
         """Run reflector finding analysis and display results"""
         if len(self.viewer.all_points) == 0:
@@ -1873,13 +2048,33 @@ def apply_dark_theme(app):
 
 
 if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    apply_dark_theme(app)
+
+    _base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    _icon = QIcon(os.path.join(_base, 'Icon.ico'))
+    app.setWindowIcon(_icon)
+
+    # --- Splash screen ---
+    _splash_pix = QPixmap(os.path.join(_base, 'Icon.ico')).scaled(
+        300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation
+    )
+    _splash = QSplashScreen(_splash_pix, Qt.WindowStaysOnTopHint)
+    _splash.show()
+    _splash.showMessage("Loading configuration...", Qt.AlignBottom | Qt.AlignHCenter, QColor(200, 200, 200))
+    app.processEvents()
+
     config_created, eps, min_samples, confidence_check, min_confidence, freq_weight, max_freq_threshold, \
     lgv_div_weight, max_lgv_threshold, timestamp_weight, max_time_variance, spatial_weight, max_spatial_stddev, \
     log_radius, db3_radius, reflector_radius, highlight_radius, ekf_config = load_configuration()
 
-    app = QApplication(sys.argv)
-    apply_dark_theme(app)
-    
+    _splash.showMessage("Starting application...", Qt.AlignBottom | Qt.AlignHCenter, QColor(200, 200, 200))
+    app.processEvents()
+
     window = MainWindow()
+    window.setWindowIcon(_icon)
+    window.setMinimumSize(1024, 600)
     window.showMaximized()
+
+    _splash.finish(window)
     sys.exit(app.exec_())
