@@ -574,6 +574,7 @@ class EKFReaderThread(QThread):
                 "man_run":   plc.get_symbol(symbols["Man_Run"][0])             if not man_run_bypass else None,
                 "isnotmoving": plc.get_symbol(symbols["IsNotMoving"][0])       if not isnotmoving_bypass else None,
                 "forw":        plc.get_symbol(symbols["ForwMotion"][0])        if "ForwMotion" in symbols else None,
+                "reflectors":  plc.get_symbol(reflectors_sym),
             }
             return h
 
@@ -605,7 +606,9 @@ class EKFReaderThread(QThread):
                     lgv_x = handles["lgv_x"].read()
                     lgv_y = handles["lgv_y"].read()
                     lgv_h = handles["lgv_h"].read()
-                    raw_data = plc.read_by_name(reflectors_sym, ctypes.c_ubyte * _REFLECTOR_RAW_SIZE)
+                    _refl = handles["reflectors"]
+                    raw_data = plc.read(_refl.index_group, _refl.index_offset, ctypes.c_ubyte * _REFLECTOR_RAW_SIZE)
+                    forw_motion = handles["forw"].read() if handles.get("forw") else True
 
                     avoid      = handles["avoid"].read()      if handles["avoid"]      else False
                     quality    = handles["quality"].read()    if handles["quality"]    else 0.0
@@ -639,7 +642,6 @@ class EKFReaderThread(QThread):
 
                     previous_unassoc = unassoc_all
 
-                    forw_motion = handles["forw"].read() if handles.get("forw") else True
                     self.cycle_data.emit(lgv_x, lgv_y, lgv_h, associated, new_unassoc, conditions_met, forw_motion, quality)
 
                 except pyads.ADSError as e:
@@ -1176,36 +1178,43 @@ class DXFViewer(QGraphicsView):
             self.centerOn(x_mm, y_mm)
 
     def update_associated_reflectors(self, reflectors_mm):
-        """Replace the green associated-reflector dots with the current set."""
-        for item in self.ekf_associated_items:
-            self.scene.removeItem(item)
-        self.ekf_associated_items.clear()
-
+        """Update green associated-reflector dots using an item pool to avoid scene invalidations."""
+        needed = len(reflectors_mm)
         r = self.reflector_radius * 4
         ring_width = max(r * 0.45, 8)
         green_pen = QPen(QColor(0, 220, 80, 230), ring_width)
-        # Font scaled so text height ≈ r (1 pt ≈ 0.353 mm in scene units)
         label_font = QFont("Arial", max(1, int(r * 0.75)))
-        # Y-flip correction: items in a Y-flipped scene appear upside-down;
-        # applying scale(1,-1) on the item counteracts the view flip.
         flip_tf = QTransform.fromScale(1, -1)
-        for x, y, lid in reflectors_mm:
-            ellipse = QGraphicsEllipseItem(x - r, y - r, r * 2, r * 2)
+
+        # Shrink pool: remove excess items from scene (pop label first, then ellipse)
+        while len(self.ekf_associated_items) // 2 > needed:
+            self.scene.removeItem(self.ekf_associated_items.pop())  # label
+            self.scene.removeItem(self.ekf_associated_items.pop())  # ellipse
+
+        # Grow pool: create new items only when count increases
+        while len(self.ekf_associated_items) // 2 < needed:
+            ellipse = QGraphicsEllipseItem(0, 0, 1, 1)
             ellipse.setBrush(Qt.transparent)
             ellipse.setPen(green_pen)
             ellipse.setZValue(5)
             self.scene.addItem(ellipse)
-            self.ekf_associated_items.append(ellipse)
-
-            label = QGraphicsSimpleTextItem(str(lid))
+            label = QGraphicsSimpleTextItem("")
             label.setFont(label_font)
-            label.setBrush(QColor(255, 255, 100))   # yellow
+            label.setBrush(QColor(255, 255, 100))
             label.setTransform(flip_tf)
-            # Place label baseline (visual top after flip) slightly above centre
-            label.setPos(x + r * 1.15, y + r * 0.5)
             label.setZValue(6)
             self.scene.addItem(label)
+            self.ekf_associated_items.append(ellipse)
             self.ekf_associated_items.append(label)
+
+        # Update all active items in-place (no add/remove = no scene invalidation)
+        for i, (x, y, lid) in enumerate(reflectors_mm):
+            ellipse = self.ekf_associated_items[i * 2]
+            ellipse.setPen(green_pen)
+            ellipse.setRect(x - r, y - r, r * 2, r * 2)
+            label = self.ekf_associated_items[i * 2 + 1]
+            label.setText(str(lid))
+            label.setPos(x + r * 1.15, y + r * 0.5)
 
     def add_unassociated_reflectors(self, reflectors_mm, lgv_x_mm, lgv_y_mm):
         """Accumulate new non-associated reflector dots (EKF viewer — same size as green donuts)."""
